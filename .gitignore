@@ -1,0 +1,66 @@
+# Project-local runtime and index state
+.atl/
+.codegraph/
+
+# Dependencies, builds, tests, and caches
+node_modules/
+dist/
+build/
+out/
+coverage/
+.nyc_output/
+.cache/
+.parcel-cache/
+.turbo/
+*.tsbuildinfo
+.eslintcache
+.npm/
+.pnpm-store/
+
+# npm pack output
+*.tgz
+
+# Logs and diagnostics
+*.log
+*.log.*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local secrets (keep shareable templates)
+.env
+.env.*
+!.env.example
+!.env.*.example
+!.env.template
+!.env.*.template
+
+# Editors
+.vscode/
+.idea/
+*.code-workspace
+.history/
+*.swp
+*.swo
+*~
+
+# OS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+*.lnk
+$RECYCLE.BIN/
+.Trash-*/
+.nfs*
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej

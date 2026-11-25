@@ -1,0 +1,62 @@
+# Normalize text to LF, matching .editorconfig
+* text=auto eol=lf
+
+# Scripts: Unix LF, Windows batch CRLF
+*.sh text eol=lf
+*.bash text eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# PowerShell supports LF on Windows, macOS, and Linux
+*.ps1 text eol=lf
+*.psm1 text eol=lf
+*.psd1 text eol=lf
+
+# Source, configuration, and documentation
+*.ts text eol=lf
+*.tsx text eol=lf
+*.js text eol=lf
+*.jsx text eol=lf
+*.mjs text eol=lf
+*.cjs text eol=lf
+*.json text eol=lf
+*.jsonc text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.toml text eol=lf
+*.xml text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+*.scss text eol=lf
+*.md text eol=lf diff=markdown
+*.mdx text eol=lf diff=markdown
+*.txt text eol=lf
+
+# Dotfiles without an extension
+.editorconfig text eol=lf
+.gitattributes text eol=lf
+.gitignore text eol=lf
+LICENSE text eol=lf
+
+# Binary assets (clear the catch-all EOL attribute)
+*.png binary -eol
+*.jpg binary -eol
+*.jpeg binary -eol
+*.gif binary -eol
+*.webp binary -eol
+*.ico binary -eol
+*.svg text eol=lf
+*.zip binary -eol
+*.tar binary -eol
+*.gz binary -eol
+*.tgz binary -eol
+*.7z binary -eol
+*.woff binary -eol
+*.woff2 binary -eol
+*.ttf binary -eol
+*.otf binary -eol
+*.pdf binary -eol
+*.doc binary -eol
+*.docx binary -eol
+*.xls binary -eol
+*.xlsx binary -eol
