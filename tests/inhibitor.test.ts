@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { test } from "node:test";
 import { createInhibitor } from "../src/inhibitor.ts";
@@ -39,6 +40,26 @@ test("start inhibits sleep without idle, uses the Pi PID watchdog, and starts on
     { detached: true, stdio: "ignore" },
   ]]);
   assert.equal(JSON.stringify(spawns).includes("idle"), false);
+});
+
+test("an acquired inhibitor lets an otherwise idle Node parent exit", () => {
+  const moduleUrl = new URL("../src/inhibitor.ts", import.meta.url).href;
+  const parent = spawnSync(process.execPath, ["--input-type=module", "-e", `
+    import { spawn } from 'node:child_process';
+    import { createInhibitor } from ${JSON.stringify(moduleUrl)};
+    let helper;
+    const inhibitor = createInhibitor({
+      pid: process.pid, platform: 'linux', kill: process.kill,
+      spawn: (_, args, options) => helper = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 1000)'], options),
+    });
+    if (!inhibitor.acquire('test') || !helper.pid) throw new Error('helper not acquired');
+    process.once('exit', () => helper.kill());
+    process.once('beforeExit', () => {
+      if (!inhibitor.has('test')) throw new Error('parent waited for inhibitor loss');
+    });
+  `], { encoding: "utf8", timeout: 10000 });
+  assert.ifError(parent.error);
+  assert.equal(parent.status, 0, parent.stderr);
 });
 
 test("stop signals only the owned group and is harmless when inactive", () => {

@@ -5,7 +5,7 @@ export interface InhibitorDependencies {
   pid: number;
   platform?: NodeJS.Platform;
   env?: { SystemRoot?: string };
-  spawn: (command: string, args: string[], options: SpawnOptions) => Pick<ChildProcess, "pid" | "on">;
+  spawn: (command: string, args: string[], options: SpawnOptions) => Pick<ChildProcess, "pid" | "on"> & { unref?(): void };
   kill: (pid: number, signal: NodeJS.Signals) => void;
 }
 
@@ -68,6 +68,7 @@ try {
     };
     started.on("error", clear);
     started.on("exit", clear);
+    started.unref?.();
   }
   return {
     get active() { return child !== null; },
