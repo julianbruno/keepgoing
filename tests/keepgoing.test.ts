@@ -1468,3 +1468,459 @@ test("S2 file identity: a timer cannot cross a same-ID file switch before lifecy
   assert.deepEqual([h.sent.length, h.owners.size], [0, 0]);
 });
 
+for (const navigateBeforeAbort of [false, true]) {
+  test(`S2 durable abort: marker off branch after reload (tree before abort: ${navigateBeforeAbort})`, async () => {
+    const source = harness();
+    const failedEntry = { type: "message", id: "error-node", message: failure };
+    source.branch.push(failedEntry);
+    await source.emit("session_start");
+    await source.emit("agent_end", { messages: settled });
+    if (navigateBeforeAbort) {
+      source.branch.length = 0;
+      source.ctx.sessionManager.getEntries = () => [failedEntry, ...source.ctx.sessionManager.getBranch()];
+      await source.emit("session_tree");
+    }
+    await source.emit("agent_settled", { aborted: true });
+    // Reload on the failure itself, not on the descendant that recorded the abort.
+    const h = harness();
+    h.branch.push(structuredClone(failedEntry));
+    h.ctx.sessionManager.getEntries = () => [...h.ctx.sessionManager.getBranch(), ...source.entries.map(item => ({ type: "custom", ...item }))];
+    await h.emit("session_start");
+    await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+    await h.emit("agent_end", { messages: [h.branch[0].message] });
+    await h.emit("agent_settled", { aborted: false });
+    h.advance(390_000);
+    assert.deepEqual([h.jobs.length, h.sent.length], [0, 0]);
+  });
+}
+
+test("S2 durable abort: a separate event copy of the unsettled branch failure cannot start recovery", async () => {
+  const h = harness();
+  const message = { ...failure, timestamp: Date.parse("2026-09-12T11:59:00Z") };
+  h.branch.push({ type: "message", id: "unsettled", message });
+  await h.emit("session_start");
+  await h.emit("agent_end", { messages: [structuredClone(message)] });
+  const command = h.commands.get("jb:keepgoing");
+  await command.handler("on", h.ctx);
+  assert.equal(h.jobs.length, 0);
+  await h.emit("agent_settled", { aborted: true });
+  await command.handler("on", h.ctx);
+  h.advance(390_000);
+  assert.deepEqual([h.jobs.length, h.sent.length], [0, 0]);
+});
+
+test("S2 durable abort: a failed entry visible only at settlement is marked for reload", async () => {
+  const h = harness();
+  const message = { ...failure, timestamp: Date.parse("2026-09-12T11:59:00Z") };
+  await h.emit("session_start");
+  await h.emit("agent_end", { messages: [message] });
+  const failed = { type: "message", id: "late", message: structuredClone(message) };
+  h.ctx.sessionManager.getEntries = () => [failed, ...h.ctx.sessionManager.getBranch()];
+  await h.emit("session_tree");
+  await h.emit("agent_settled", { aborted: true });
+  const reload = harness();
+  reload.branch.push(structuredClone(failed));
+  replay(reload, h.entries);
+  await reload.emit("session_start");
+  await reload.commands.get("jb:keepgoing").handler("on", reload.ctx);
+  reload.advance(390_000);
+  assert.deepEqual([reload.jobs.length, reload.sent.length], [0, 0]);
+});
+
+for (const phase of ["lookup", "timer"]) {
+  test(`S2 abort with no candidate: cancels provider ${phase} and prevents replay`, async () => {
+    let finish!: (value: number) => void;
+    let signal!: AbortSignal;
+    const deadline = Date.parse("2026-09-12T12:05:00Z");
+    const h = harness({ resolve: (...args: any[]) => {
+      signal = args.at(-1);
+      return phase === "timer" ? deadline : new Promise<number>(r => { finish = r; });
+    } });
+    h.branch.push({ type: "message", id: "last-failure", message: failure });
+    const command = h.commands.get("jb:keepgoing");
+    const on = command.handler("on", h.ctx);
+    if (phase === "timer") { await on; assert.equal(liveJobs(h).length, 1); }
+    await h.emit("agent_settled", { aborted: true });
+    if (phase === "lookup") { assert.equal(signal.aborted, true); finish(deadline); }
+    await on;
+    await command.handler("on", h.ctx);
+    h.advance(390_000);
+    assert.deepEqual([liveJobs(h).length, h.sent.length, h.owners.size], [0, 0, 1]);
+  });
+}
+
+test("inhibitor loss before abort cannot rearm the failed entry", async () => {
+  const h = backendHarness();
+  const cmd = h.commands.get("jb:keepgoing");
+  await cmd.handler("on", h.ctx);
+  h.branch.push({ type: "message", id: "interrupted", message: failure });
+  await h.emit("agent_end", { messages: [failure] });
+  h.children[0].emit("exit", 1);
+  await h.emit("agent_settled", { aborted: true });
+  await cmd.handler("on", h.ctx);
+  h.advance(390_000);
+  assert.deepEqual([h.jobs.length, h.sent.length], [0, 0]);
+  assert.equal(h.backend.has(oneLease), true);
+});
+
+test("legacy pre-send record throttles a fresh opt-in without granting consent", async () => {
+  const h = harness({}, "tui");
+  h.branch.push({ type: "custom", customType: "keepgoing.resume", data: { enabled: true, resumes: 1,
+    consentSession: "one", lastResume: Date.parse("2026-09-12T11:59:59Z") } }, { type: "message", message: failure });
+  await h.emit("session_start");
+  assert.equal(h.owners.size, 0);
+  await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+  assert.match(h.messages.at(-1)!, /five-minute repeat guard/);
+  assert.deepEqual([h.jobs.length, h.sent.length], [0, 0]);
+});
+
+test("S2 legacy submission: a fresh opt-in still observes the five-minute repeat guard", async () => {
+  const h = harness({}, "tui");
+  h.branch.push({ type: "custom", customType: "keepgoing.resume", data: { enabled: true, resumes: 1,
+    lastContinuationSession: "one", lastContinuationAt: Date.parse("2026-09-12T11:59:59Z") } },
+    { type: "message", message: failure });
+  await h.emit("session_start");
+  assert.equal(h.owners.size, 0);
+  const command = h.commands.get("jb:keepgoing");
+  await command.handler("on", h.ctx);
+  assert.match(h.messages.at(-1)!, /five-minute repeat guard/);
+  assert.deepEqual([h.jobs.length, h.sent.length], [0, 0]);
+  h.advance(299_000);
+  await command.handler("on", h.ctx);
+  h.advance(390_000);
+  assert.deepEqual(h.sent, [resetContinuation]);
+});
+
+test("new session cannot inherit another session's enabled state or timer", async () => {
+  const h = harness();
+  await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+  await h.emit("agent_end", { messages: settled });
+  await h.emit("agent_settled");
+  h.setSession("two");
+  await h.emit("session_start");
+  assert.equal(h.owners.size, 0);
+  h.advance(390_000);
+  assert.equal(h.sent.length, 0);
+});
+
+test("Esc and shutdown cancel a pending timer and release only owned session lease", async () => {
+  const h = harness({}, "tui");
+  await h.commands.get("jb:keepgoing").handler("inhibit on", h.ctx);
+  await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+  await h.emit("agent_end", { messages: settled });
+  await h.emit("agent_settled");
+  assert.equal(h.shortcuts.size, 0);
+  assert.equal(h.terminalListeners.size, 1);
+  assert.deepEqual([...h.terminalListeners][0]("\u001b"), { consume: true });
+  assert.equal(h.terminalListeners.size, 0);
+  await h.commands.get("jb:keepgoing").handler("status", h.ctx);
+  assert.match(h.messages.at(-1)!, /Previous wait cancelled by Escape/);
+  h.advance(390_000);
+  assert.equal(h.sent.length, 0);
+  await h.emit("session_shutdown", { reason: "reload" });
+  assert.deepEqual([...h.owners], ["manual"]);
+});
+
+test("terminal listener ignores non-Escape input and unsubscribes on disable", async () => {
+  const h = harness({}, "tui");
+  await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+  await h.emit("agent_end", { messages: settled });
+  await h.emit("agent_settled");
+  assert.equal([...h.terminalListeners][0]("a"), undefined);
+  await h.commands.get("jb:keepgoing").handler("off", h.ctx);
+  assert.equal(h.terminalListeners.size, 0);
+});
+
+test("navigating a session branch cancels its pending job", async () => {
+  const h = harness();
+  await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+  await h.emit("agent_end", { messages: settled });
+  await h.emit("agent_settled");
+  await h.emit("session_tree");
+  h.advance(390_000);
+  assert.equal(h.sent.length, 0);
+});
+
+test("TUI and RPC settled handlers detach without waiting for recovery", async () => {
+  for (const mode of ["tui", "rpc"]) {
+    const h = harness({}, mode);
+    await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+    await h.emit("agent_end", { messages: settled });
+    await h.emit("agent_settled");
+    assert.equal(h.sent.length, 0);
+    assert.equal(h.jobs.length > 0, true);
+    await h.emit("session_shutdown", { reason: "quit" });
+  }
+});
+
+test("JSON/print settled handler remains alive through deadline and sends once", async () => {
+  for (const mode of ["json", "print"]) {
+    const h = harness({}, mode);
+    await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+    await h.emit("agent_end", { messages: settled });
+    let done = false;
+    const settling = h.emit("agent_settled").then(() => { done = true; });
+    for (let n = 0; n < 5; n++) await Promise.resolve();
+    assert.equal(h.jobs.length > 0, true, mode);
+    assert.equal(done, false, mode);
+    h.advance(389_000);
+    await Promise.resolve();
+    assert.equal(done, false, mode);
+    assert.equal(h.sent.length, 0);
+    h.advance(1_000);
+    await settling;
+    assert.equal(h.sent.length, 1, mode);
+    h.advance(600_000);
+    assert.equal(h.sent.length, 1, mode);
+  }
+});
+
+test("shutdown and user cancellation resolve headless settled wait without continuation", async () => {
+  for (const stop of ["session_shutdown", "input", "ui_prompt_start"]) {
+    const h = harness({}, "json");
+    await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+    await h.emit("agent_end", { messages: settled });
+    let done = false;
+    const settling = h.emit("agent_settled").then(() => { done = true; });
+    for (let n = 0; n < 5; n++) await Promise.resolve();
+    assert.equal(h.jobs.length > 0, true, stop);
+    assert.equal(done, false, stop);
+    await h.emit(stop, stop === "input" ? { source: "interactive" } : { reason: "quit", kind: "select" });
+    await settling;
+    assert.equal(done, true, stop);
+    h.advance(390_000);
+    assert.equal(h.sent.length, 0, stop);
+  }
+});
+
+test("user takeover and session replacement cancel pending recovery", async () => {
+  for (const change of ["input", "session_start"] as const) {
+    const h = harness();
+    await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+    await h.emit("agent_end", { messages: settled });
+    await h.emit("agent_settled");
+    if (change === "session_start") h.setSession("two");
+    await h.emit(change, change === "input" ? { source: "interactive", text: "Stop" } : {});
+    h.advance(390_000);
+    assert.equal(h.sent.length, 0, change);
+  }
+});
+
+test("off without a pending wait reports OFF without claiming a cancelled wait", async () => {
+  const h = harness({}, "tui");
+  const command = h.commands.get("jb:keepgoing");
+  await command.handler("on", h.ctx);
+  assert.match(h.messages.at(-1)!, /^✅ Resume is ON and watching/);
+  await command.handler("off", h.ctx);
+  assert.match(h.messages.at(-1)!, /^⏸ Resume is OFF\. Nothing is scheduled\./);
+  assert.doesNotMatch(h.messages.at(-1)!, /Previous wait|Keep this Pi session open/);
+});
+
+test("a bridge reset that already passed since the error continues promptly; a stale one does not", async () => {
+  const text = "Claude quota exceeded — rate limit (five_hour) — resets 4:00:00 PM: You've hit your 5-hour limit · resets 4pm (America/Argentina/Buenos_Aires)";
+  const errorAt = Date.parse("2026-11-17T15:58:25Z"); // 12:58 in Buenos Aires
+  {
+    const h = harness({}, "tui");
+    h.setNow("2026-11-17T19:43:00Z"); // 16:43 local: the 4pm reset already passed
+    h.branch.push({ type: "message", message: { ...bridgeFailure, errorMessage: text, timestamp: errorAt } });
+    await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+    assert.match(h.messages.at(-1)!, /^⏳ Resume is ON\. Claude's usage window already reset/);
+    assert.equal(h.sent.length, 0);
+    h.advance(5_000);
+    assert.equal(h.sent.length, 1);
+  }
+  {
+    const h = harness({}, "tui");
+    h.setNow("2026-11-18T19:43:00Z"); // a day later: too old to continue automatically
+    h.branch.push({ type: "message", message: { ...bridgeFailure, errorMessage: text, timestamp: errorAt } });
+    await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+    assert.match(h.messages.at(-1)!, /No continuation was scheduled: Claude's usage reset passed more than six hours ago\./);
+    h.advance(6 * 3_600_000);
+    assert.equal(h.sent.length, 0);
+  }
+});
+
+test("a future bridge reset with an error timestamp still waits until the printed minute", async () => {
+  const text = "Claude quota exceeded — rate limit (five_hour) — resets 4:00:00 PM: You've hit your 5-hour limit · resets 4pm (America/Argentina/Buenos_Aires)";
+  for (const timestamp of [Date.parse("2026-11-17T15:58:25Z"), Number.NaN, Date.parse("2026-11-18T00:00:00Z")]) {
+    const h = harness({}, "tui");
+    h.setNow("2026-11-17T18:30:00Z"); // 15:30 local; NaN and future timestamps fall back to now
+    h.branch.push({ type: "message", message: { ...bridgeFailure, errorMessage: text, timestamp } });
+    await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+    assert.match(h.messages.at(-1)!, /^⏳ Resume is ON\. Waiting for Claude's usage window to reset\./, String(timestamp));
+    h.advance(31 * 60_000 + 30_000 - 1);
+    assert.equal(h.sent.length, 0, String(timestamp));
+    h.advance(1);
+    assert.equal(h.sent.length, 1, String(timestamp));
+  }
+});
+
+test("every Resume report ends with the package version as its final paragraph", async () => {
+  const h = harness({}, "tui");
+  const command = h.commands.get("jb:keepgoing");
+  const headlines: Record<string, RegExp> = {
+    status: /^⏸ Resume is OFF\. Nothing is scheduled\./, on: /^✅ Resume is ON and watching/,
+    "wait 0m": /^No safe wait scheduled\.\n⚠️ Resume is ON, but nothing was scheduled/, off: /^⏸ Resume is OFF\. Nothing is scheduled\./,
+  };
+  for (const arg of ["status", "on", "wait 0m", "off", "status"]) {
+    await command.handler(arg, h.ctx);
+    const report = h.messages.at(-1)!;
+    assert.match(report, headlines[arg], arg);
+    assert.ok(report.endsWith(`\n\n${versionLine}`), `${arg}: ${report}`);
+    assert.equal(report.split(versionLine).length, 2, `${arg}: version appears once`);
+  }
+  await command.handler("wait 24m", h.ctx);
+  await command.handler("status", h.ctx);
+  assert.match(h.messages.at(-1)!, /^⏳ Resume is OFF\. Waiting for your requested time only\./);
+  assert.ok(h.messages.at(-1)!.endsWith(`\n\nCancel with /jb:keepgoing off or Escape.\n\n${versionLine}`));
+});
+
+test("version line falls back without throwing when package.json is unreadable or invalid", t => {
+  const dir = mkdtempSync(join(tmpdir(), "keepgoing-version-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const file = (name: string, body: string) => { writeFileSync(join(dir, name), body); return pathToFileURL(join(dir, name)); };
+  assert.equal(packageVersionLine(file("ok.json", JSON.stringify({ version: "9.8.7" }))), "keepgoing 9.8.7");
+  for (const url of [pathToFileURL(join(dir, "missing.json")), file("bad.json", "{"), file("none.json", "{}"),
+    file("number.json", JSON.stringify({ version: 2 })), file("empty.json", JSON.stringify({ version: "" })), file("null.json", "null")]) {
+    assert.equal(packageVersionLine(url), "keepgoing (version unknown)", String(url));
+  }
+});
+
+test("a freshly settled bridge failure whose reset already passed continues after 5 s", async () => {
+  const h = harness({}, "tui");
+  h.setNow("2026-11-17T19:43:00Z");
+  const command = h.commands.get("jb:keepgoing");
+  await command.handler("on", h.ctx);
+  assert.match(h.messages.at(-1)!, /^✅ Resume is ON and watching/);
+  const count = h.messages.length;
+  await h.emit("agent_end", { messages: [passedFailure] });
+  await h.emit("agent_settled");
+  assert.equal(h.messages.length, count + 1);
+  assert.match(h.messages.at(-1)!, /^⏳ Resume is ON\. Claude's usage window already reset; continuing in a few seconds\./);
+  assert.ok(h.messages.at(-1)!.includes("Time remaining: 5s"));
+  assert.equal(h.sent.length, 0);
+  assert.equal(liveJobs(h).length, 2, "dispatch timer and status tick");
+  assert.equal(h.terminalListeners.size, 1);
+  h.advance(4_999);
+  assert.equal(h.sent.length, 0);
+  h.advance(1);
+  assert.deepEqual(h.sent, [resetContinuation]);
+  assert.equal(liveJobs(h).length, 0);
+  assert.equal(h.terminalListeners.size, 0);
+  assert.equal(h.entries.at(-1).data.resumes, 1);
+  assert.equal(h.entries.at(-1).data.lastContinuationAt, Date.parse("2026-11-17T19:43:05Z"));
+  await command.handler("status", h.ctx);
+  assert.match(h.messages.at(-1)!, /^✅ Resume is ON and watching/);
+  assert.ok(h.messages.at(-1)!.includes("Previously: the continuation was sent to Pi."));
+  h.advance(6 * 3_600_000);
+  assert.equal(h.sent.length, 1);
+});
+
+for (const stop of ["Escape", "off"]) {
+  test(`${stop} during the 5 s passed-reset window cancels without a continuation`, async () => {
+    const h = harness({}, "tui");
+    h.setNow("2026-11-17T19:43:00Z");
+    h.branch.push({ type: "message", message: passedFailure });
+    const command = h.commands.get("jb:keepgoing");
+    await command.handler("on", h.ctx);
+    assert.match(h.messages.at(-1)!, /^⏳ Resume is ON\. Claude's usage window already reset/);
+    assert.equal(h.terminalListeners.size, 1);
+    h.advance(2_000);
+    assert.equal(h.sent.length, 0);
+    if (stop === "Escape") {
+      assert.deepEqual([...h.terminalListeners][0]("\u001b"), { consume: true });
+      await command.handler("status", h.ctx);
+      assert.match(h.messages.at(-1)!, /^✅ Resume is ON and watching/);
+      assert.ok(h.messages.at(-1)!.includes("Previous wait cancelled by Escape."));
+      assert.ok(h.owners.has(oneLease));
+    } else {
+      await command.handler("off", h.ctx);
+      assert.match(h.messages.at(-1)!, /^⏸ Resume is OFF\. Nothing is scheduled\./);
+      assert.ok(h.messages.at(-1)!.includes("Previous wait cancelled by /jb:keepgoing off.\n\nNext: Use /jb:keepgoing on to monitor usage limits, or /jb:keepgoing wait <1h|24m> for a one-off delay."));
+      assert.equal(h.owners.has(oneLease), false);
+      assert.equal(h.entries.at(-1).data.enabled, false);
+    }
+    assert.equal(h.terminalListeners.size, 0);
+    assert.equal(liveJobs(h).length, 0);
+    h.advance(6 * 3_600_000);
+    assert.equal(h.sent.length, 0);
+    assert.equal(h.entries.at(-1).data.resumes, 0);
+  });
+}
+
+test("a passed bridge reset continues at exactly six hours old and is stale one millisecond later", async () => {
+  for (const [offset, continues] of [[0, true], [1, false]] as const) {
+    const h = harness({}, "tui");
+    h.setNow(new Date(passedReset + 6 * 3_600_000 + offset).toISOString());
+    h.branch.push({ type: "message", message: passedFailure });
+    await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+    const report = h.messages.at(-1)!;
+    if (continues) {
+      assert.match(report, /^⏳ Resume is ON\. Claude's usage window already reset; continuing in a few seconds\./);
+      assert.equal(liveJobs(h).length, 2);
+      h.advance(4_999);
+      assert.equal(h.sent.length, 0);
+      h.advance(1);
+      assert.deepEqual(h.sent, [resetContinuation]);
+      assert.equal(liveJobs(h).length, 0);
+      assert.equal(h.entries.at(-1).data.resumes, 1);
+    } else {
+      assert.match(report, /^⚠️ Resume is ON, but nothing was scheduled\.\n/);
+      assert.ok(report.includes("No continuation was scheduled: Claude's usage reset passed more than six hours ago.\n\nNext: Use /jb:keepgoing wait <1h|24m> for an explicit delay."));
+      assert.equal(h.jobs.length, 0);
+      assert.equal(h.terminalListeners.size, 0);
+      h.advance(6 * 3_600_000);
+      assert.equal(h.sent.length, 0);
+      assert.equal(h.entries.at(-1).data.resumes, 0);
+    }
+  }
+});
+
+test("print/JSON settled passed reset blocks for 5 s and sends once; retroactive activation does not wait", async () => {
+  for (const mode of ["print", "json"]) {
+    const h = harness({}, mode);
+    h.setNow("2026-11-17T19:43:00Z");
+    await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+    await h.emit("agent_end", { messages: [passedFailure] });
+    let done = false;
+    const settling = h.emit("agent_settled").then(() => { done = true; });
+    for (let n = 0; n < 5; n++) await Promise.resolve();
+    assert.equal(done, false, mode);
+    assert.deepEqual(liveJobs(h).map(job => job.deadline), [Date.parse("2026-11-17T19:43:05Z")], mode);
+    h.advance(4_999);
+    await Promise.resolve();
+    assert.equal(done, false, mode);
+    assert.equal(h.sent.length, 0, mode);
+    h.advance(1);
+    await settling;
+    assert.deepEqual(h.sent, [resetContinuation], mode);
+    assert.equal(liveJobs(h).length, 0, mode);
+    assert.equal(h.entries.at(-1).data.resumes, 1, mode);
+    assert.deepEqual(h.messages, [], mode);
+    h.advance(6 * 3_600_000);
+    assert.equal(h.sent.length, 1, mode);
+
+    const retro = harness({}, mode);
+    retro.setNow("2026-11-17T19:43:00Z");
+    retro.branch.push({ type: "message", message: passedFailure });
+    await retro.commands.get("jb:keepgoing").handler("on", retro.ctx);
+    assert.equal(retro.jobs.length, 0, mode);
+    retro.advance(6 * 3_600_000);
+    assert.equal(retro.sent.length, 0, mode);
+    assert.equal(retro.entries.at(-1).data.resumes, 0, mode);
+  }
+});
+
+test("a non-bridge reset at or before now never takes the passed-reset path", async () => {
+  for (const provider of ["anthropic", "openai-codex"]) {
+    const h = harness({ resolve: () => Date.parse("2026-11-17T19:00:00Z") }, "tui");
+    h.setNow("2026-11-17T19:00:30Z");
+    h.branch.push({ type: "message", message: { role: "assistant", provider, stopReason: "error", timestamp: Date.parse("2026-11-17T15:00:00Z"),
+      errorMessage: "5-hour usage limit reached; resets at 2026-11-17T19:00:00Z" } });
+    await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+    assert.match(h.messages.at(-1)!, /^⚠️ Resume is ON, but nothing was scheduled\.\n/, provider);
+    assert.doesNotMatch(h.messages.at(-1)!, /already reset/, provider);
+    h.advance(6 * 3_600_000);
+    assert.equal(h.sent.length, 0, provider);
+  }
+});
