@@ -656,3 +656,407 @@ test("rejected replacement wait preserves existing timer and lease", async () =>
   assert.equal(h.sent[0].message, "Continue");
 });
 
+test("failed timer setup releases a standalone lease and removes the Escape listener", async () => {
+  const h = harness({ schedule: () => { throw Error("timer unavailable"); } }, "tui");
+  const cmd = (arg: string) => h.commands.get("jb:keepgoing").handler(arg, h.ctx);
+  await cmd("inhibit on");
+  await assert.rejects(cmd("wait 1h"), /timer unavailable/);
+  await cmd("status");
+  assert.match(h.messages.at(-1)!, /Resume is OFF\. Nothing is scheduled/);
+  assert.deepEqual([...h.owners], ["manual"]);
+  assert.deepEqual([h.terminalListeners.size, h.entries.length, h.sent.length], [0, 0, 0]);
+});
+
+test("enqueue rejection after lease acquisition rolls back temporary ownership", async () => {
+  const owners = new Set<string>(["manual"]);
+  let h: ReturnType<typeof harness>;
+  const backend = {
+    get active() { return owners.size > 0; },
+    has: (owner: string) => owners.has(owner),
+    acquire: (owner: string) => { owners.add(owner); h.ctx.isIdle = () => false; return true; },
+    release: (owner: string) => owners.delete(owner),
+  };
+  h = harness({}, "tui", backend as any);
+  await h.commands.get("jb:keepgoing").handler("wait 1h", h.ctx);
+  assert.deepEqual([...owners], ["manual"]);
+  assert.equal(h.jobs.length, 0);
+  assert.equal(h.entries.length, 0);
+  assert.match(h.messages.at(-1)!, /No safe wait scheduled/);
+  assert.match(h.messages.at(-1)!, /No continuation was scheduled: the agent is busy/);
+});
+
+test("timed dispatch rechecks idle, queue, and session; 95% warning is not exhaustion", async () => {
+  for (const guard of ["busy", "queued", "session"]) {
+    const h = harness();
+    await h.commands.get("jb:keepgoing").handler("wait 24m", h.ctx);
+    if (guard === "queued") h.ctx.hasPendingMessages = () => true;
+    if (guard === "busy") h.ctx.isIdle = () => false;
+    if (guard === "session") h.setSession("two");
+    h.advance(1_440_000);
+    assert.equal(h.sent.length, 0);
+    assert.equal(h.owners.size, 0, guard);
+  }
+  const h = harness();
+  await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+  await h.emit("agent_end", { messages: [{ ...bridgeFailure, errorMessage: "Claude usage warning: 95% of session limit used" }] });
+  await h.emit("agent_settled");
+  assert.equal(h.jobs.length, 0);
+});
+
+for (const text of [reportedLimit, reportedQuota, "Error: " + reportedQuota]) {
+  for (const activation of ["on after error", "already monitoring"]) {
+    test(`reported five-hour format schedules and announces without status: ${activation}: ${text}`, async () => {
+      const previous = process.env.TZ;
+      process.env.TZ = "America/Argentina/Buenos_Aires";
+      try {
+        const h = harness({}, "tui");
+        h.setNow("2026-10-21T23:00:00Z");
+        h.ctx.modelRegistry.getApiKeyForProvider = async () => { throw Error("Bridge must not request OAuth"); };
+        const command = h.commands.get("jb:keepgoing");
+        const message = { ...bridgeFailure, errorMessage: text };
+        if (activation === "on after error") {
+          h.branch.push({ type: "message", message });
+          await command.handler("on", h.ctx);
+        } else {
+          await command.handler("on", h.ctx);
+          const count = h.messages.length;
+          await h.emit("agent_end", { messages: [message] });
+          assert.equal(h.messages.length, count, "wait until the agent settles");
+          await h.emit("agent_settled");
+          assert.equal(h.messages.length, count + 1, "announce automatically exactly once");
+        }
+        assert.equal(h.messages.at(-1), [
+          "⏳ Resume is ON. Waiting for Claude's usage window to reset.",
+          `Continue at: 20:51:30 · Oct 21, 2026 · ${Intl.DateTimeFormat().resolvedOptions().timeZone}\nTime remaining: 52m`,
+          "Your computer will stay awake (the screen can still turn off). Keep this Pi session open: timers end when you exit or reload Pi.",
+          "Cancel with /jb:keepgoing off or Escape.",
+          versionLine,
+        ].join("\n\n"));
+        assert.equal(h.sent.length, 0);
+        const jobs = h.jobs.filter(job => !job.cancelled).length;
+        await command.handler("on", h.ctx);
+        assert.equal(h.jobs.filter(job => !job.cancelled).length, jobs);
+        h.advance(3_090_000 - 1);
+        assert.equal(h.sent.length, 0);
+        h.advance(1);
+        assert.deepEqual(h.sent, [{ message: "Continue the interrupted request after the provider usage window reset. Do not make decisions for the user.", options: { expandPromptTemplates: false } }]);
+        assert.equal(h.entries.at(-1).data.resumes, 1);
+        h.advance(60_000);
+        assert.equal(h.sent.length, 1);
+      } finally {
+        if (previous === undefined) delete process.env.TZ;
+        else process.env.TZ = previous;
+      }
+    });
+  }
+}
+
+test("on without an error waits normally and later announces a scheduling failure", async () => {
+  for (const latest of [undefined, { role: "assistant", stopReason: "stop" }]) {
+    const h = harness({}, "tui");
+    if (latest) h.branch.push({ type: "message", message: latest });
+    const command = h.commands.get("jb:keepgoing");
+    await command.handler("on", h.ctx);
+    assert.match(h.messages.at(-1)!, /^✅ Resume is ON and watching for Claude's 5-hour usage limit\. Nothing is scheduled yet\.\n/);
+    assert.match(h.messages.at(-1)!, /When Claude reports its 5-hour limit, Resume schedules the continuation/);
+    assert.doesNotMatch(h.messages.at(-1)!, /No continuation was scheduled:/);
+    assert.equal(h.jobs.length, 0);
+    assert.equal(h.sent.length, 0);
+    assert.equal(h.entries.at(-1).data.enabled, true);
+    assert.ok(h.owners.has(oneLease));
+    const count = h.messages.length;
+    await h.emit("agent_end", { messages: [{ ...bridgeFailure, errorMessage: reportedLimit.replace("8:50pm", "invalid") }] });
+    await h.emit("agent_settled");
+    assert.equal(h.messages.length, count + 1);
+    // A malformed reset no longer matches the exact Bridge format, so it is reported as unrecognized.
+    assert.match(h.messages.at(-1)!, /No continuation was scheduled: unrecognized usage-limit error/);
+    assert.match(h.messages.at(-1)!, /Next:.*wait/);
+    assert.equal(h.jobs.length, 0);
+    assert.equal(h.sent.length, 0);
+    assert.equal(h.entries.at(-1).data.resumes, 0);
+    assert.equal(h.entries.at(-1).data.enabled, true);
+  }
+});
+
+for (const debug of [undefined, "0", "1"]) {
+  test(`unknown usage-limit diagnostic with KEEPGOING_DEBUG=${debug ?? "unset"}`, async t => {
+    const previous = process.env.KEEPGOING_DEBUG;
+    t.after(() => {
+      if (previous === undefined) delete process.env.KEEPGOING_DEBUG;
+      else process.env.KEEPGOING_DEBUG = previous;
+    });
+    if (debug === undefined) delete process.env.KEEPGOING_DEBUG;
+    else process.env.KEEPGOING_DEBUG = debug;
+    const warnings: unknown[][] = [];
+    t.mock.method(console, "warn", (...args: unknown[]) => warnings.push(args));
+    const h = harness({ resolve: () => assert.fail("diagnostics must not look up resets") }, "tui");
+    const command = h.commands.get("jb:keepgoing");
+    const privateText = "Bearer synthetic-secret request_id=r123 /private/file https://example.invalid/?key=fake\r\n\x1b[31m\u2028" + "x".repeat(2048);
+    const cases = [
+      ["claude-bridge", `RATE-LIMIT (FIVE_HOUR) resets 8:50pm ${privateText}`, "rate-limit", "five-hour", "present"],
+      ["anthropic", `usage limit unclear; session window ${privateText} resets`, "usage-limit", "session", "absent"],
+      ["openai-codex", `${privateText} rate limit`, "unknown", "unknown", "absent"],
+    ];
+    const end = (message: typeof bridgeFailure) => h.emit("agent_end", { messages: [message] });
+    await end({ ...bridgeFailure, errorMessage: "rate limit" }); // OFF
+    await command.handler("on", h.ctx);
+    const entries = structuredClone(h.entries);
+    for (const errorMessage of [reportedLimit, "network timeout", "monthly usage limit reached", "invalid API key", "rate limit warning"]) {
+      await end({ ...bridgeFailure, errorMessage });
+    }
+    await end({ ...bridgeFailure, provider: "other\nprovider", errorMessage: "rate limit" });
+    assert.deepEqual(warnings, []);
+    for (const [provider, errorMessage, family, window, reset] of cases) {
+      const message = { ...bridgeFailure, provider, errorMessage };
+      await end(message);
+      await h.emit("agent_settled");
+      h.branch.push({ type: "message", message });
+      await command.handler("on", h.ctx); // same object: no second warning
+      const summary = `keepgoing: provider=${provider} reason=unrecognized_usage_limit`;
+      const line = debug === "1" ? `${summary} family=${family} window=${window} reset-marker=${reset}` : summary;
+      assert.deepEqual(warnings.splice(0), [[line]]);
+      assert.ok(line.length <= 160);
+      assert.match(h.messages.at(-1)!, /unrecognized usage-limit error.*console/);
+      assert.doesNotMatch(h.messages.join("\n"), /synthetic-secret|private\/file|example\.invalid/);
+    }
+    assert.equal(h.jobs.length, 0);
+    assert.equal(h.sent.length, 0);
+    assert.deepEqual(h.entries, entries);
+  });
+}
+
+test("automatic recovery announces guard rejection without scheduling or changing counters", async () => {
+  const h = harness({}, "tui");
+  await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+  h.ctx.hasPendingMessages = () => true;
+  const count = h.messages.length;
+  await h.emit("agent_end", { messages: [failure] });
+  await h.emit("agent_settled");
+  assert.equal(h.messages.length, count + 1);
+  assert.match(h.messages.at(-1)!, /No continuation was scheduled: messages are queued/);
+  assert.equal(h.jobs.length, 0);
+  assert.equal(h.sent.length, 0);
+  assert.equal(h.entries.at(-1).data.resumes, 0);
+});
+
+for (const activation of ["on after error", "already monitoring"]) {
+  test(`Claude quota exceeded schedules the printed reset minute with ${activation}`, async () => {
+    const h = harness({}, "tui");
+    const start = Date.parse("2026-09-29T15:00:00Z");
+    const deadline = Date.parse("2026-09-29T16:31:30Z");
+    h.setNow("2026-09-29T15:00:00Z");
+    h.ctx.model.provider = "claude-bridge";
+    h.ctx.modelRegistry.isUsingOAuth = () => { throw Error("OAuth inspected"); };
+    h.ctx.modelRegistry.getApiKeyForProvider = async () => { throw Error("token requested"); };
+    const message = { ...bridgeFailure, errorMessage: "Claude quota exceeded — rate limit (five_hour) — resets at 1:30:00 PM: You've hit your session limit · resets 1:30pm (America/Argentina/Buenos_Aires)" };
+    const command = h.commands.get("jb:keepgoing");
+    if (activation === "on after error") {
+      h.branch.push({ type: "message", message });
+      await command.handler("on", h.ctx);
+    } else {
+      await command.handler("on", h.ctx);
+      await h.emit("agent_end", { messages: [message] });
+      await h.emit("agent_settled");
+    }
+    await command.handler("status", h.ctx);
+    assert.match(h.messages.at(-1)!, /Resume is ON\. Waiting for Claude's usage window to reset/);
+    assert.match(h.messages.at(-1)!, /Time remaining: 1h 32m/);
+    assert.equal(h.sent.length, 0);
+    assert.equal(h.jobs.filter(job => !job.cancelled).length, 2);
+    await command.handler("on", h.ctx);
+    h.advance(deadline - start - 1);
+    assert.equal(h.sent.length, 0);
+    h.advance(1);
+    assert.deepEqual(h.sent, [{ message: "Continue the interrupted request after the provider usage window reset. Do not make decisions for the user.", options: { expandPromptTemplates: false } }]);
+    h.advance(60_000);
+    assert.equal(h.sent.length, 1);
+    assert.equal(h.entries.at(-1).data.resumes, 1);
+  });
+}
+
+test("one activation recovers consecutive Claude windows and keeps monitoring after each dispatch", async () => {
+  const h = harness({}, "tui");
+  h.setNow("2026-10-21T15:00:00Z");
+  const command = h.commands.get("jb:keepgoing");
+  await command.handler("on", h.ctx);
+  for (const [index, start, reset, deadline] of [
+    [1, "2026-10-21T15:00:00Z", "1:30pm", "2026-10-21T16:31:30Z"],
+    [2, "2026-10-21T20:00:00Z", "6:30pm", "2026-10-21T21:31:30Z"],
+  ] as const) {
+    h.setNow(start);
+    await h.emit("agent_start");
+    await h.emit("input", { source: "extension" });
+    const message = { ...bridgeFailure, errorMessage: `Claude quota exceeded — rate limit (five_hour): You've hit your session limit · resets ${reset} (America/Argentina/Buenos_Aires)` };
+    await h.emit("agent_end", { messages: [message] });
+    await h.emit("agent_settled");
+    await command.handler("status", h.ctx);
+    assert.match(h.messages.at(-1)!, /Resume is ON\. Waiting for Claude's usage window to reset/);
+    h.advance(Date.parse(deadline) - Date.parse(start) - 1);
+    assert.equal(h.sent.length, index - 1);
+    h.advance(1);
+    assert.equal(h.sent.length, index);
+    assert.deepEqual(h.sent.at(-1), { message: "Continue the interrupted request after the provider usage window reset. Do not make decisions for the user.", options: { expandPromptTemplates: false } });
+    await h.emit("agent_start");
+    await h.emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
+    await h.emit("agent_settled");
+    await command.handler("status", h.ctx);
+    assert.match(h.messages.at(-1)!, /Resume is ON and watching for Claude's 5-hour usage limit\. Nothing is scheduled yet/);
+    assert.equal(h.entries.at(-1).data.enabled, true);
+    assert.equal(h.entries.at(-1).data.resumes, index);
+    assert.equal(h.entries.at(-1).data.lastContinuationAt, Date.parse(deadline));
+    assert.ok(h.owners.has(oneLease));
+    h.advance(60_000);
+    assert.equal(h.sent.length, index, "monitoring alone must not send another continuation");
+  }
+});
+
+test("late bridge activation schedules overnight local reset without OAuth, immediate turn, or duplicate", async () => {
+  const h = harness({}, "tui");
+  h.setNow("2026-09-29T02:19:00Z");
+  h.ctx.model.provider = "claude-bridge";
+  h.ctx.modelRegistry.isUsingOAuth = () => { throw Error("OAuth inspected"); };
+  h.ctx.modelRegistry.getApiKeyForProvider = async () => { throw Error("token requested"); };
+  h.branch.push({ type: "message", message: bridgeFailure });
+  const command = h.commands.get("jb:keepgoing");
+  await command.handler("on", h.ctx);
+  const deadline = Date.parse("2026-09-29T04:51:30Z");
+  assert.match(h.messages.at(-1)!, /Continue at: .*Sep 29, 2026/);
+  assert.equal(h.sent.length, 0);
+  assert.equal(h.jobs[0].deadline, Date.parse("2026-09-29T02:20:00Z"));
+  await command.handler("on", h.ctx);
+  h.advance(deadline - Date.parse("2026-09-29T02:19:00Z") - 1);
+  assert.equal(h.sent.length, 0);
+  h.advance(1);
+  assert.equal(h.sent.length, 1);
+  h.advance(60_000);
+  assert.equal(h.sent.length, 1);
+});
+
+test("newly settled bridge failure schedules one buffered turn and headless invalid reset does not wait", async () => {
+  const h = harness();
+  h.setNow("2026-09-29T02:19:00Z");
+  await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+  await h.emit("agent_end", { messages: [bridgeFailure] });
+  await h.emit("agent_settled");
+  assert.equal(h.sent.length, 0);
+  h.advance(Date.parse("2026-09-29T04:51:30Z") - Date.parse("2026-09-29T02:19:00Z"));
+  assert.equal(h.sent.length, 1);
+  for (const mode of ["print", "json"]) {
+    const run = harness({}, mode);
+    run.setNow("2026-09-29T02:19:00Z");
+    await run.commands.get("jb:keepgoing").handler("on", run.ctx);
+    await run.emit("agent_end", { messages: [{ ...bridgeFailure, errorMessage: "Claude rate limit (five_hour): You've hit your session limit · resets 1:50am (Invalid/Zone)" }] });
+    await run.emit("agent_settled");
+    assert.equal(run.jobs.length, 0, mode);
+    assert.equal(run.sent.length, 0, mode);
+  }
+});
+
+test("settled bridge recovery respects manual wait and rejects stale or invalid limits without fallback", async () => {
+  const h = harness();
+  h.setNow("2026-09-29T02:19:00Z");
+  await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+  await h.commands.get("jb:keepgoing").handler("wait 3h", h.ctx);
+  await h.emit("agent_end", { messages: [bridgeFailure] });
+  await h.emit("agent_settled");
+  assert.equal(h.jobs.filter(job => !job.cancelled).length, 1);
+  h.advance(3 * 60 * 60_000);
+  assert.equal(h.sent.length, 1);
+  for (const message of [{ ...bridgeFailure, errorMessage: "Claude rate limit (five_hour): You've hit your session limit · resets 1:50am (Invalid/Zone)" },
+    { ...bridgeFailure, errorMessage: "Claude rate limit (five_hour): You've hit your session limit · resets 6:50am (America/Argentina/Buenos_Aires)" },
+    { ...bridgeFailure, errorMessage: "Claude rate limit (weekly): You've hit your session limit · resets 1:50am (America/Argentina/Buenos_Aires)" }]) {
+    const run = harness();
+    run.setNow("2026-09-29T02:19:00Z");
+    run.branch.push({ type: "message", message });
+    await run.commands.get("jb:keepgoing").handler("on", run.ctx);
+    assert.equal(run.jobs.length, 0);
+    await run.emit("agent_end", { messages: [message] });
+    await run.emit("agent_settled");
+    assert.equal(run.jobs.length, 0);
+    assert.equal(run.entries.at(-1).data.fallback, 0);
+  }
+  for (const later of [{ role: "user", content: "later" }, { role: "assistant", stopReason: "stop" }]) {
+    const run = harness();
+    run.setNow("2026-09-29T02:19:00Z");
+    run.branch.push({ type: "message", message: bridgeFailure }, { type: "message", message: later });
+    await run.commands.get("jb:keepgoing").handler("on", run.ctx);
+    assert.equal(run.jobs.length, 0);
+  }
+});
+
+test("activation schedules latest settled branch failure once and reports local retry time without an immediate turn", async () => {
+  const h = harness({}, "tui");
+  h.branch.push({ type: "message", message: failure });
+  await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+  assert.equal(h.jobs.filter(job => !job.cancelled).length, 2);
+  assert.equal(h.sent.length, 0);
+  assert.match(h.messages.at(-1)!, /Continue at: .*:06:30/);
+  await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+  assert.equal(h.jobs.filter(job => !job.cancelled).length, 2);
+  await h.commands.get("jb:keepgoing").handler("status", h.ctx);
+  assert.match(h.messages.at(-1)!, /Continue at: \d{2}:\d{2}:\d{2}/);
+  h.advance(390_000);
+  assert.equal(h.sent.length, 1);
+  await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+  assert.match(h.messages.at(-1)!, /^⚠️ Resume is ON, but nothing was scheduled\.\n/);
+  h.advance(390_000);
+  assert.equal(h.sent.length, 1);
+});
+
+test("activation ignores stale, unsupported, permanent, and decision-blocked errors", async () => {
+  for (const later of [{ type: "message", message: { role: "user", content: "later" } }, { type: "message", message: { role: "assistant", stopReason: "stop" } }]) {
+    const h = harness({}, "tui");
+    h.branch.push({ type: "message", message: failure }, later);
+    await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+    assert.equal(h.jobs.length, 0);
+    assert.match(h.messages.at(-1)!, /^✅ Resume is ON and watching for Claude's 5-hour usage limit\. Nothing is scheduled yet\.\n/);
+  }
+  for (const message of [{ ...failure, provider: "other" }, { ...failure, errorMessage: "monthly usage limit reached" }]) {
+    const h = harness({}, "tui");
+    h.branch.push({ type: "message", message });
+    await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+    assert.equal(h.jobs.length, 0);
+  }
+  const h = harness({}, "tui");
+  h.branch.push({ type: "message", message: failure });
+  await h.emit("tool_execution_start", { toolCallId: "choice", toolName: "ask_user_choice" });
+  await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+  assert.equal(h.jobs.length, 0);
+  await h.commands.get("jb:keepgoing").handler("status", h.ctx);
+  assert.match(h.messages.at(-1)!, /^⚠️ Resume is ON, but nothing was scheduled\.\n/);
+});
+
+test("retroactive print/json activation returns promptly without a disposable recovery timer", async () => {
+  for (const mode of ["print", "json"]) {
+    const h = harness({}, mode);
+    h.branch.push({ type: "message", message: failure });
+    let returned = false;
+    const activation = h.commands.get("jb:keepgoing").handler("on", h.ctx).then(() => { returned = true; });
+    for (let n = 0; n < 5; n++) await Promise.resolve();
+    assert.equal(returned, true, mode);
+    await activation;
+    assert.equal(h.jobs.length, 0, mode);
+    assert.equal(h.sent.length, 0, mode);
+  }
+});
+
+test("concurrent retroactive lookups with unavailable reset never schedule", async () => {
+  const finish: Array<(value: null) => void> = [];
+  const h = harness({ resolve: () => new Promise<null>(resolve => finish.push(resolve)) }, "tui");
+  h.branch.push({ type: "message", message: { ...failure, errorMessage: "5-hour usage limit reached" } });
+  const command = h.commands.get("jb:keepgoing");
+  const first = command.handler("on", h.ctx);
+  const second = command.handler("on", h.ctx);
+  assert.equal(finish.length, 2);
+  finish[0](null);
+  finish[1](null);
+  await Promise.all([first, second]);
+  assert.equal(h.entries.at(-1).data.fallback, 0);
+  assert.equal(h.jobs.filter(job => !job.cancelled).length, 0);
+  assert.equal(h.sent.length, 0);
+  await command.handler("status", h.ctx);
+  assert.match(h.messages.at(-1)!, /^⚠️ Resume is ON, but nothing was scheduled\.\n/);
+  h.advance(600_000);
+  assert.equal(h.sent.length, 0);
+});
+
