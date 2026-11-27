@@ -1,0 +1,51 @@
+{
+  "name": "pi-keepgoing",
+  "version": "1.0.0",
+  "description": "Opt-in usage-limit recovery, scheduled continuation, and system-sleep protection for Pi, scoped to the current session.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Julian Bruno",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/julianbruno/keepgoing.git"
+  },
+  "homepage": "https://github.com/julianbruno/keepgoing#readme",
+  "bugs": {
+    "url": "https://github.com/julianbruno/keepgoing/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "keepgoing",
+    "sleep",
+    "usage-limits",
+    "auto-resume"
+  ],
+  "files": [
+    "extensions/keepgoing.ts",
+    "src/*.ts",
+    "docs/*.md",
+    "docs/screenshots/resume-on.png",
+    "docs/screenshots/resume-wait-status.png",
+    "!docs/discord-launch-es.md",
+    "README.md",
+    "WHY-KEEPGOING.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "install.sh",
+    "install.ps1",
+    "uninstall.sh",
+    "uninstall.ps1"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/keepgoing.ts"
+    ]
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test tests/*.test.ts"
+  }
+}
