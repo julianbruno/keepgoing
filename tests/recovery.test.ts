@@ -217,3 +217,247 @@ test("independent verifier counterexamples never qualify as exhaustion", () => {
   assert.equal(classifyLimit("claude-bridge", "Claude rate limit (five_hour): You've hit your 5-hour limit; 0 requests remaining · resets 4pm (Etc/GMT+3)"), false);
 });
 
+test("after the known time and window numbers are removed, any other count vetoes exhaustion", () => {
+  const tails = ["remaining: 0 requests, 2,000 tokens", "remaining: 0 requests, 10 000 tokens", "remaining: 0 requests, 2k tokens",
+    "remaining requests: 0, messages = 3", "remaining requests: 0, messages 3", "remaining requests: 0, messages (3)",
+    "remaining requests: 0, messages → 3", "remaining: 0 requests, 3 Opus messages", "remaining: 0 requests, six messages",
+    "remaining: 0 requests, ten messages", "remaining: 0 requests, a couple of messages", "remaining: 0 requests, many messages",
+    "remaining: 0 requests, 3 queries", "remaining: 0 requests, 3 calls", "remaining: 0 requests, 3 conversations",
+    "remaining: 0 requests, 3 uses", "remaining: 0 requests, 3 chats", "remaining: 0 requests, 3 responses",
+    "remaining: 0 requests, 3 completions", "remaining: 0 requests, 3 msgs", "remaining: 0 requests, 3 reqs",
+    "remaining: 0 requests, 3 more", "remaining: 0 requests, Sonnet: 3", "remaining: 0 requests, quota 3",
+    "requests used: 0 of 50", "Sonnet: 3", "3 more", "３ messages left"];
+  for (const tail of tails) {
+    for (const text of [`You've hit your 5-hour limit; ${tail} · resets 4pm (Europe/Madrid)`,
+      `Claude rate limit (five_hour): You've hit your 5-hour limit; ${tail}`,
+      `Error: Claude quota exceeded — rate limit (five_hour) — resets 4:00:00 PM: You've hit your 5-hour limit; ${tail}`]) {
+      assert.equal(classifyLimit("claude-bridge", text), false, text);
+    }
+    for (const provider of ["openai-codex", "anthropic"]) {
+      assert.equal(classifyLimit(provider, `5-hour usage limit reached; ${tail}. Try again later.`), false, `${provider}: ${tail}`);
+    }
+  }
+  for (const provider of ["openai-codex", "anthropic"]) for (const text of [
+    "Have you reached your 5-hour usage limit.", "¿5-hour usage limit reached.", "Is your 5-hour usage limit reached. Try again later.",
+  ]) assert.equal(classifyLimit(provider, text), false, `${provider}: ${text}`);
+  // Numbers that belong to the window, a reset time, a duration or a timestamp are not capacity.
+  for (const provider of ["openai-codex", "anthropic"]) for (const text of [
+    "You've hit your usage limit. Try again in 4 hours 12 minutes.", "5-hour usage limit reached. Try again at 4:00 PM.",
+    "5-hour usage limit reached. Try again at 16:30.",
+    "5-hour usage limit reached. Resets at 2026-09-12T13:00:00Z.", "5-hour usage limit reached. Try again in a few hours.",
+  ]) assert.equal(classifyLimit(provider, text), true, `${provider}: ${text}`);
+  assert.equal(classifyLimit("claude-bridge", "Claude rate limit (five_hour) — resets 1:50:00 AM: You've hit your session limit · resets 1:50am (Etc/GMT+3)"), true);
+});
+
+test("times are only ignored after a reset or retry phrase, and count words are capacity", () => {
+  const tails = ["remaining: 0 requests, 3M tokens", "remaining: 0 requests, 1.5M tokens", "remaining requests: 0, tokens: 2M",
+    "remaining: 0 requests, 2m tokens", "remaining requests: 0, Opus 3h", "remaining requests: 0 (Opus 3/10)",
+    "0 requests remaining (Opus: 3/50)", "remaining requests: 0 (messages 3/50)", "remaining: 0 requests, one Opus message",
+    "remaining: 0 requests, some Opus messages", "remaining: 0 requests, a few Opus messages", "remaining: 0 requests, several Opus messages",
+    "remaining: 0 requests, five Opus messages", "remaining: 0 requests, twenty messages", "remaining: 0 requests, fifty messages",
+    "remaining: 0 requests, lots of messages", "remaining: 0 requests, plenty of messages", "remaining requests: 0; messages: unlimited",
+    "remaining: 0 requests; unlimited messages", "remaining requests: 0, messages = five", "remaining: 0 requests; you can still send one Opus message",
+    "remaining: 0 requests, 2 hours of usage", "remaining: 0 requests, 30 minutes of usage"];
+  for (const tail of tails) {
+    for (const text of [`You've hit your 5-hour limit; ${tail} · resets 4pm (Europe/Madrid)`,
+      `Claude rate limit (five_hour): You've hit your 5-hour limit; ${tail}`,
+      `Error: Claude quota exceeded — rate limit (five_hour) — resets 4:00:00 PM: You've hit your 5-hour limit; ${tail}`]) {
+      assert.equal(classifyLimit("claude-bridge", text), false, text);
+    }
+    for (const provider of ["openai-codex", "anthropic"]) {
+      assert.equal(classifyLimit(provider, `5-hour usage limit reached; ${tail}. Try again later.`), false, `${provider}: ${tail}`);
+    }
+  }
+  for (const provider of ["openai-codex", "anthropic"]) for (const text of [
+    "5-hour usage limit reached. Try again in 2 hours 15 minutes.", "5-hour usage limit reached. Try again in 4h 30m.",
+    "5-hour usage limit reached. Try again at 16:00 UTC.", "5-hour usage limit reached. Try again at 4:00 p.m.",
+    "5-hour usage limit reached. Try again in an hour.", "5-hour usage limit reached. Try again in 90 minutes.",
+    "5-hour usage limit reached. Try again in 3 hrs.", "5-hour usage limit reached. Resets at 12am (UTC+2).",
+    "5-hour usage limit reached. Resets at 1760000000.", "5-hour usage limit reached. Try again in several hours.",
+    "5-hour usage limit reached. Try again in one hour.", "5-hour usage limit reached. Try again in five minutes.",
+    "5-hour usage limit reached. Try again in a few minutes.", "5-hour usage limit reached. Please wait some time and try again later.",
+  ]) assert.equal(classifyLimit(provider, text), true, `${provider}: ${text}`);
+  // A count chained after a reset time is not swallowed as a duration.
+  assert.equal(classifyLimit("anthropic", "5-hour usage limit reached. Resets in 2h, 3M tokens."), false);
+});
+
+test("warnings, conditions and unreadable reset shapes fail closed", () => {
+  // Portable syntax: the module must not rely on RegExp modifiers, which need Node 23 or later.
+  const source = readFileSync(new URL("../src/recovery.ts", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /\(\?[-a-z]+:/);
+  for (const provider of ["openai-codex", "anthropic"]) for (const text of [
+    "You have hit the usage limit warning. Try again later.", "You've reached your 5-hour usage limit warning level. Try again later.",
+    "You've hit your 5-hour usage limit alert. Try again later.", "Warning: 5-hour usage limit reached soon. Try again later.",
+    "You've almost reached your 5-hour usage limit. Try again later.", "After you hit your 5-hour usage limit, try again later.",
+    "Whenever you hit your 5-hour usage limit, try again later.", "5-hour usage limit reached; you can still send fifteen more. Try again later.",
+    "5-hour usage limit reached; you can still send more. Try again later.", "Heads-up: 5-hour usage limit reached shortly.",
+    "Upcoming: 5-hour usage limit reached.", "Warnings: you've hit your 5-hour usage limit. Try again later.",
+    "Caution: you've hit your 5-hour usage limit. Try again later.", "Nearing your 5-hour usage limit. 5-hour usage limit reached.",
+    "You're close to your limit. You've hit your 5-hour usage limit. Try again later.", "You've hit your 5-hour usage limit, but you can continue. Try again later.",
+    "You've hit your usage limit. Try again in 3 days.", "You've hit your usage limit. Try again in 12 hours.",
+    "You've hit your usage limit. Try again in seven hours.",
+  ]) assert.equal(classifyLimit(provider, text), false, `${provider}: ${text}`);
+  // The classifier accepts only reset shapes the Bridge reset reader can resolve.
+  for (const reset of ["· resets 0am (Europe/Madrid)", "· resets 13pm (Europe/Madrid)", "· resets 1:60am (Europe/Madrid)", "· resets 4 pm (Europe/Madrid)", "· resets 4pm", "· resets 4:30:00pm (Europe/Madrid)", "· resets 4p.m. (Europe/Madrid)", "· resets at 4pm (Europe/Madrid)"]) {
+    assert.equal(classifyLimit("claude-bridge", `You've hit your 5-hour limit ${reset}`), false, reset);
+  }
+  for (const [reset, from] of [["· resets 4pm (Europe/Madrid)", "2026-11-17T13:00:00Z"],
+    ["· resets 4:30pm (America/Argentina/Buenos_Aires)", "2026-11-17T17:00:00Z"], ["· resets 12am (Etc/GMT+3)", "2026-11-18T01:00:00Z"]]) {
+    const text = `You've hit your 5-hour limit ${reset}`;
+    assert.equal(classifyLimit("claude-bridge", text), true, reset);
+    assert.notEqual(bridgeResetFromText(text, Date.parse(from)), undefined, reset);
+  }
+});
+
+test("bridge accepts nearby five-hour spelling and punctuation variants", () => {
+  for (const text of [
+    "You’ve hit your 5-hour limit · resets 8:50pm (America/Argentina/Buenos_Aires)",
+    "You have hit your five-hour limit · resets 8:50pm (America/Argentina/Buenos_Aires)",
+    "You've hit your 5 hour limit · resets 8:50pm (America/Argentina/Buenos_Aires)",
+    "  Error: Claude quota exceeded – rate limit (five_hour): You've hit your 5-hour limit · resets 8:50pm (America/Argentina/Buenos_Aires)  ",
+  ]) assert.equal(classifyLimit("claude-bridge", text), true, text);
+});
+
+test("unknown usage-limit candidates are diagnostic only, excluding unrelated and permanent errors", () => {
+  assert.equal(isUnrecognizedUsageLimit("claude-bridge", "Claude rate limit (five_hour): usage cap reached; resets 8:50pm (America/Argentina/Buenos_Aires)"), true);
+  for (const provider of ["anthropic", "openai-codex"]) {
+    assert.equal(isUnrecognizedUsageLimit(provider, "Usage quota exhausted"), true);
+  }
+  for (const text of [
+    "You've hit your 5-hour limit · resets 8:50pm (America/Argentina/Buenos_Aires)",
+    "network timeout", "invalid API key; rate limit", "monthly usage limit reached",
+    "weekly usage limit reached", "billing error; rate limit", "Claude usage warning: 95% of session limit used",
+  ]) assert.equal(isUnrecognizedUsageLimit("claude-bridge", text), false, text);
+  assert.equal(isUnrecognizedUsageLimit("other", "rate limit exceeded"), false);
+});
+
+test("bridge reset picks next future zoned minute, including midnight and DST repeats", async () => {
+  const registry = { isUsingOAuth: () => { throw Error("bridge must not inspect OAuth"); }, getApiKeyForProvider: async () => { throw Error("bridge token requested"); } };
+  const request = async () => { throw Error("bridge endpoint requested"); };
+  const reset = (text: string, now: string) => resolveReset("claude-bridge", text, registry, request as any, Date.parse(now));
+  const actual = "Claude rate limit (five_hour) — resets 1:50:00 AM: You've hit your session limit · resets 1:50am (America/Argentina/Buenos_Aires)";
+  assert.equal(await reset(actual, "2026-09-29T02:19:00Z"), Date.parse("2026-09-29T04:51:30Z"));
+  assert.equal(await reset("You've hit your session limit · resets 12:00am (America/Argentina/Buenos_Aires)", "2026-09-29T02:59:00Z"), Date.parse("2026-09-29T03:01:30Z"));
+  // At fall-back 01:30 occurs twice; wait until after the later occurrence rather than firing prematurely.
+  assert.equal(await reset("resets 1:30am (America/New_York)", "2026-11-01T05:00:00Z"), Date.parse("2026-11-01T06:31:30Z"));
+  assert.equal(await reset("resets 1:30am (America/New_York)", "2026-11-01T05:45:00Z"), Date.parse("2026-11-01T06:31:30Z"));
+  assert.equal(await reset("resets 2:30am (America/New_York)", "2026-03-08T06:30:00Z"), undefined, "spring-forward gap must not invent a reset");
+  // Claude Bridge omits ":00" on the hour: "resets 4pm (Zone)".
+  const hourOnly = "Error: Claude quota exceeded — rate limit (five_hour) — resets 4:00:00 PM: You've hit your 5-hour limit · resets 4pm (America/Argentina/Buenos_Aires)";
+  assert.equal(await reset(hourOnly, "2026-11-17T17:30:00Z"), Date.parse("2026-11-17T19:01:30Z"));
+  assert.equal(await reset("resets 12am (America/Argentina/Buenos_Aires)", "2026-09-29T02:59:00Z"), Date.parse("2026-09-29T03:01:30Z"));
+});
+
+test("bridge malformed and out-of-window resets fail closed without OAuth or fallback", async () => {
+  let calls = 0;
+  const registry = { isUsingOAuth: () => { calls++; return true; }, getApiKeyForProvider: async () => { calls++; return "token"; } };
+  const request = async () => { calls++; return { ok: true, json: async () => ({}) }; };
+  const now = Date.parse("2026-09-29T02:19:00Z");
+  for (const suffix of ["resets 1:50am", "resets 1:50am (Invalid/Zone)", "resets 13:50am (America/Argentina/Buenos_Aires)",
+    "resets 1:60am (America/Argentina/Buenos_Aires)", "resets 1:50am (America/Argentina/Buenos_Aires) · resets 2:50am (America/Argentina/Buenos_Aires)",
+    "resets 6:50am (America/Argentina/Buenos_Aires)", "resets 5:19am (America/Argentina/Buenos_Aires)",
+    "resets 13pm (America/Argentina/Buenos_Aires)", "resets 0am (America/Argentina/Buenos_Aires)", "resets 4pm"]) {
+    assert.equal(await resolveReset("claude-bridge", `Claude rate limit (five_hour): You've hit your session limit · ${suffix}`, registry, request as any, now), undefined, suffix);
+  }
+  assert.equal(calls, 0);
+});
+
+test("reset parser bounds waits and fallback grows only to sixty minutes", () => {
+  const now = Date.parse("2026-09-12T12:00:00Z");
+  assert.equal(resetFromText("Try again at 2026-09-12T13:00:00Z", now), now + 3_600_000 + 90_000);
+  assert.equal(resetFromText("Try again at 2026-09-13T13:00:00Z", now), undefined);
+  assert.deepEqual([0,1,2,3,4].map(n => fallbackDeadline(n, now)), [10,20,40,60,60].map(n => now + n * 60_000));
+  assert.equal(parseWait("5m"), 300_000);
+  assert.equal(parseWait("1h"), 3_600_000);
+  assert.equal(parseWait("7h"), undefined);
+});
+
+test("reset instructions select the buffered instant, never the noon log prefix", () => {
+  const log = "[2026-09-12T12:00:00Z] 5-hour usage limit reached; ";
+  const now = Date.parse("2026-09-12T12:00:00Z");
+  for (const [instruction, expected] of [
+    ["try again after 2026-09-12T13:00:00Z", "2026-09-12T13:01:30Z"],
+    ["resets at 2026-09-12T14:00:00Z", "2026-09-12T14:01:30Z"],
+    [`available again at ${Date.parse("2026-09-12T14:00:00Z") / 1000}`, "2026-09-12T14:01:30Z"],
+  ]) assert.equal(resetFromText(log + instruction, now), Date.parse(expected), instruction);
+  for (const instruction of ["reset unknown", "resets at 2026-09-12T13:00:00Z or 2026-09-12T14:00:00Z",
+    "resets at 2026-09-12T13:00:00Z; try again after 2026-09-12T14:00:00Z"]) {
+    assert.equal(resetFromText(log + instruction, now), undefined, instruction);
+  }
+  assert.equal(resetFromText("2026-09-12T13:00:00Z", now), Date.parse("2026-09-12T13:01:30Z"));
+  assert.equal(resetFromText("5-hour usage limit reached until 2026-09-12T13:00:00Z", now), Date.parse("2026-09-12T13:01:30Z"));
+});
+
+for (const instruction of [
+  "Next reset is scheduled for 2026-09-12T14:00:00Z",
+  "Next reset (UTC): 2026-09-12T14:00:00Z",
+  "resets at 2026-09-12T14:00:00Z; window started at 2026-09-12T09:00:00Z",
+]) test(instruction, () => {
+  const noon = "2026-09-12T12:00:00Z";
+  assert.equal(resetFromText(`[${noon}] ${instruction}`, Date.parse(noon)), Date.parse("2026-09-12T14:01:30Z"));
+});
+
+test("next reset will be at identifies the reset, not a log time or competing instant", () => {
+  const noon = "2026-09-12T12:00:00Z";
+  const now = Date.parse(noon);
+  const text = "5-hour usage limit reached. Next reset will be at 2026-09-12T14:00:00Z";
+  for (const provider of ["anthropic", "openai-codex"]) assert.equal(classifyLimit(provider, text), true);
+  assert.equal(resetFromText(text, now), Date.parse("2026-09-12T14:01:30Z"));
+  assert.equal(resetFromText(`[${noon}] ${text}`, now), Date.parse("2026-09-12T14:01:30Z"));
+  assert.equal(resetFromText(`${text}; resets at 2026-09-12T15:00:00Z`, now), undefined);
+  assert.equal(resetFromText(`${text} or 2026-09-12T15:00:00Z`, now), undefined);
+});
+
+test("OAuth adapters use provider-specific endpoint and reset field, not other windows", async () => {
+  const calls: Array<[string, RequestInit]> = [];
+  const now = Date.parse("2026-09-12T12:00:00Z");
+  const request = async (url: string, init: RequestInit) => {
+    calls.push([url, init]);
+    return { ok: true, json: async () => url.includes("chatgpt")
+      ? { rate_limit: { primary_window: { reset_at: Math.floor((now + 3_600_000) / 1000) } } }
+      : { five_hour: { resets_at: "2026-09-12T13:00:00Z" } } };
+  };
+  const registry = { isUsingOAuth: () => true, getApiKeyForProvider: async () => "token" };
+  for (const provider of ["openai-codex", "anthropic"] as const) {
+    assert.equal(await resolveReset(provider, "usage limit reached", registry, request as any, now), now + 3_690_000);
+  }
+  assert.equal(calls[0][0], "https://chatgpt.com/backend-api/wham/usage");
+  assert.equal(calls[1][0], "https://api.anthropic.com/api/oauth/usage");
+  assert.equal((calls[1][1].headers as Record<string,string>)["anthropic-beta"], "oauth-2025-04-20");
+  assert.equal(await resolveReset("anthropic", "usage limit", { ...registry, isUsingOAuth: () => false }, request as any, now), undefined);
+  assert.equal(calls.length, 2);
+  assert.equal(await resolveReset("anthropic", "usage limit", registry, request as any, now, { provider: "openai-codex" }), undefined);
+  assert.equal(calls.length, 2, "do not send another model's token to a provider endpoint");
+  assert.equal(await resolveReset("anthropic", "usage limit", {
+    ...registry, isUsingOAuth: () => { throw new Error("registry unavailable"); },
+  }, request as any, now), undefined);
+});
+
+for (const source of ["timeout", "caller"]) test(`OAuth adapter discards late response body on ${source} abort`, async t => {
+  const timeout = new AbortController(), caller = new AbortController();
+  const timeoutMs: number[] = [];
+  t.mock.method(AbortSignal, "timeout", (ms: number) => { timeoutMs.push(ms); return timeout.signal; });
+  let requestSignal: AbortSignal | undefined;
+  const request = async (_url: string, init: RequestInit) => {
+    requestSignal = init.signal!;
+    return { ok: true, json: async () => {
+      (source === "timeout" ? timeout : caller).abort();
+      return { five_hour: { resets_at: "2026-09-12T13:00:00Z" } };
+    } };
+  };
+  const reset = await resolveReset("anthropic", "usage limit reached", { isUsingOAuth: () => true, getApiKeyForProvider: async () => "synthetic" },
+    request, Date.parse("2026-09-12T12:00:00Z"), undefined, undefined, caller.signal);
+  assert.deepEqual(timeoutMs, [8000]);
+  assert.equal(requestSignal?.aborted, true);
+  assert.equal(reset, undefined);
+});
+
+test("bridge reset defaults its search start to the current time", () => {
+  // A reset one hour from the real clock, so the default must be a usable "now".
+  const now = Date.now();
+  const at = new Date(now + 60 * 60_000).toLocaleTimeString("en-US", { timeZone: "America/Argentina/Buenos_Aires", hour: "numeric", minute: "2-digit" });
+  const text = `You've hit your 5-hour limit · resets ${at.replace(/\s+/, "").toLowerCase()} (America/Argentina/Buenos_Aires)`;
+  const result = bridgeResetFromText(text);
+  assert.notEqual(result, undefined, text);
+  assert.equal(result, bridgeResetFromText(text, now), text);
+});
