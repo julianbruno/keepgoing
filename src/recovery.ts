@@ -19,10 +19,26 @@ const capacityWord = /\b(?:remain\w*|left|unused|spare|balance|percent|unlimited
 const farReset = new RegExp([
   String.raw`(?:\d+(?:\.\d+)?|an?|one|two|three|four|five|six|seven|few|several)\s*(?:days?|weeks?|months?)`,
   String.raw`(?:next|this|later this|after the)\s+(?:week|weekend|month)`,
-  String.raw`(?:mon|tues|wednes|thurs|fri|satur|sun)day|tomorrow|tonight|overnight|fortnight`,
+  String.raw`(?:mon|tues|wednes|thurs|fri|satur|sun)day|(?:mon|tue|tues|wed|thu|thur|thurs|fri|sat)\.?|tomorrow|tonight|overnight|fortnight`,
   String.raw`(?:[6-9]|\d{2,})(?:\.\d+)?\s*(?:hours?|hrs?|h)|(?:six|seven|eight|nine|ten|eleven|twelve|twenty[ -]four)\s*(?:hours?|hrs?)`,
   String.raw`(?:3[6-9]\d|[4-9]\d\d|\d{4,})\s*(?:minutes?|mins?)`,
 ].map(part => String.raw`\b(?:${part})\b`).join("|"), "i");
+// After a retry or reset phrase only a closed tail is accepted: nothing, "later", a duration
+// under six hours, a clock time with an optional zone, or an absolute instant. Anything else
+// (weekdays, "next week", long or unusual durations) fails closed.
+const tailHours = String.raw`(?:[0-5](?:\.\d+)?|an?|one|two|three|four|five|a few|several|a couple of)\s*(?:hours?|hrs?)`;
+const tailMinutes = String.raw`(?:\d{1,2}|[12]\d\d|3[0-5]\d|an?|a few|several|five|ten|fifteen|twenty|thirty|forty(?:[ -]five)?|fifty)\s*(?:minutes?|mins?)`;
+const tailExtraMinutes = String.raw`(?:[0-5]?\d|a few|five|ten|fifteen|twenty|thirty|forty(?:[ -]five)?|fifty)\s*(?:minutes?|mins?)`;
+const tailDuration = String.raw`(?:${tailHours}(?:\s*(?:and\s+)?${tailExtraMinutes})?|${tailMinutes}|\d{1,3}\s*(?:seconds?|secs?)|[0-5]h(?:\s*[0-5]?\dm)?)`;
+const tailClock = String.raw`(?:(?:1[0-2]|0?[1-9])(?::[0-5]\d){0,2}\s*[ap]\.?\s*m\.?|(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?)(?:\s*(?:\((?:[A-Za-z_]+\/)+[A-Za-z0-9_+-]+\)|\(?(?:UTC|GMT)(?:\s*[+-]\s*\d{1,2}(?::?\d\d)?)?\)?))?`;
+const tailInstant = String.raw`(?:\d{4}-\d\d-\d\d[T ]\d\d:\d\d(?::\d\d(?:\.\d+)?)?(?:Z|[+-]\d\d:?\d\d)|1\d{9})`;
+const allowedTail = new RegExp(String.raw`^\s*(?:|later(?:\s+today)?|(?:in|after|within)\s+${tailDuration}|(?:at|after|from)?\s*${tailClock}|(?:at|after|on)?\s*${tailInstant})\s*$`, "i");
+const retryPhrase = /\b(?:try(?:ing)? again|retry|resets?(?:\s+(?:time|is|will be))?|resetting|reset will be|available again)\b/gi;
+const hasOnlyAllowedTails = (text: string) => [...text.matchAll(retryPhrase)].every(match => {
+  const rest = text.slice(match.index + match[0].length);
+  const end = rest.search(/[;!\n]|\.(?=\s|$)/);
+  return allowedTail.test(end === -1 ? rest : rest.slice(0, end));
+});
 const warningWord = /\b(?:warnings?|alerts?|notices?|threshold|level|soon|shortly|upcoming|caution|heads[ -]up|almost|nearly|nearing|approaching|close to)\b/i;
 const unitWord = /\b(?:requests?|reqs?|messages?|msgs?|prompts?|turns?|tokens?|credits?|quer(?:y|ies)|calls?|conversations?|chats?|responses?|completions?|uses)\b/i;
 // Numbers are explained only by the window label or by a time that follows a reset or
@@ -69,7 +85,7 @@ export function classifyLimit(provider: string, text: string): provider is Provi
   }
   return (provider === "openai-codex" || provider === "anthropic") && !exclusions.test(text) &&
     usageLimit.test(text) && (windowSignal.test(text) || resetSignal.test(text)) &&
-    !questionMark.test(text) && !warningWord.test(text) && !farReset.test(text) && !capacityWord.test(text) && !mentionsUnit(text) && !hasUnexplainedCount(text) && hasExhaustion(text);
+    !questionMark.test(text) && !warningWord.test(text) && !farReset.test(text) && hasOnlyAllowedTails(text) && !capacityWord.test(text) && !mentionsUnit(text) && !hasUnexplainedCount(text) && hasExhaustion(text);
 }
 // Broader signals are diagnostic only: never use them to authorize a continuation.
 export function isUnrecognizedUsageLimit(provider: string, text: string): boolean {
@@ -169,6 +185,8 @@ export async function resolveReset(provider: Provider, text: string, registry: O
   if (provider === "claude-bridge") return bridgeResetFromText(text, errorAt ?? now);
   const fromError = resetFromText(text, now);
   if (fromError) return fromError;
+  // The provider stated an explicit instant that is out of range or ambiguous; never swap it for the API window.
+  if (/\b\d{4}-\d\d-\d\d(?!\d)|\b1\d{9}\b/.test(text)) return undefined;
   // Only Pi-managed OAuth tokens may be sent to these private usage endpoints.
   try {
     if (model && (typeof model !== "object" || (model as { provider?: string }).provider !== provider)) return undefined;

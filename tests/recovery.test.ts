@@ -318,6 +318,30 @@ test("warnings, conditions and unreadable reset shapes fail closed", () => {
   }
 });
 
+test("only a short, closed reset tail can follow a retry phrase", async () => {
+  for (const provider of ["openai-codex", "anthropic"]) {
+    for (const tail of ["at 4:00 PM Tue", "at 4pm on Tue", "next Mon", "Sat", "in twenty hours", "in fifteen hours", "in thirty hours",
+      "in 86400 seconds", "in 30000 seconds", "next year", "in a year", "in December", "in the coming days", "at the end of the week",
+      "this coming week", "after the holidays", "next cycle", "once your plan renews", "in the morning", "at midnight", "in a while",
+      "at 2026-12-04", "in 0h 400m", "in 5h 90m", "in 5 hours and 120 minutes", "at 4pm on December fifth", "in 6.5 hours"]) {
+      assert.equal(classifyLimit(provider, `You've hit your usage limit. Try again ${tail}.`), false, `${provider}: ${tail}`);
+    }
+    for (const tail of ["later", "in 5 hours", "in 300 minutes", "in 359 minutes", "in 4h 59m", "in 2.5 hours", "in 5.5 hours",
+      "in 2 hours 15 minutes", "in an hour", "in a few minutes", "in several hours", "at 4pm", "at 4:00 p.m.", "at 16:30", "at 16:00 UTC",
+      "after 2026-09-12T14:00:00Z"]) {
+      assert.equal(classifyLimit(provider, `You've hit your usage limit. Try again ${tail}.`), true, `${provider}: ${tail}`);
+    }
+  }
+  // A stated instant outside the window is never replaced by the usage API's five-hour reset.
+  let requests = 0;
+  const registry = { isUsingOAuth: () => true, getApiKeyForProvider: async () => "synthetic" };
+  const request = async () => { requests++; return { ok: true, json: async () => ({ five_hour: { resets_at: "2026-09-12T13:00:00Z" } }) }; };
+  for (const text of ["You've hit your usage limit. Try again after 2026-12-04T10:00:00Z.", "You've hit your usage limit. Try again at 1798000000."]) {
+    assert.equal(await resolveReset("anthropic", text, registry, request as any, Date.parse("2026-09-12T12:00:00Z")), undefined, text);
+  }
+  assert.equal(requests, 0);
+});
+
 test("bridge accepts nearby five-hour spelling and punctuation variants", () => {
   for (const text of [
     "You’ve hit your 5-hour limit · resets 8:50pm (America/Argentina/Buenos_Aires)",
