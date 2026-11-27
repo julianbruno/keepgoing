@@ -2,6 +2,8 @@
 
 **Usage-limit recovery, scheduled continuation, and system-sleep protection for Pi.**
 
+Works in plain Pi and alongside [gentle-pi](https://pi.dev/packages/gentle-pi) (Gentle Shell); see [Gentle AI interoperability](WHY-KEEPGOING.md#with-gentle-ai-keep-the-workflow-moving-not-the-consent-gates).
+
 Use keepgoing when you want an **open Pi session** to send `Continue` after a supported usage limit resets or after a delay you choose. It keeps the computer awake during the wait without keeping the screen on or unlocking it.
 
 - **Usage-limit recovery:** opt in for supported Codex, Anthropic, and Claude Bridge errors; automatic continuation requires a usable reset.

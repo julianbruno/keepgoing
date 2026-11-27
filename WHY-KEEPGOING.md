@@ -82,12 +82,12 @@ When using Gentle AI through `gentle-pi`/Gentle Shell:
 
 This is **event-based interoperability**, not a direct Gentle AI API integration. keepgoing observes Pi prompt and tool events; it does not inspect native review lineages, maintain receipts, or know every possible consent surface. It does not depend on Gentle AI and also works in plain Pi.
 
-### What Gentle Shell already does about quota (gentle-pi 4.8.0)
+### What Gentle Shell already does about quota (gentle-pi 5.1.0)
 
-- **No keep-awake.** A search of the gentle-pi 4.8.0 package for inhibit, caffeinate, keep-awake, and wake-lock found nothing. keepgoing's sleep protection does not duplicate a Gentle feature.
-- **Opt-in model fallback chains.** When a profile has an ordered fallback list in `profile-fallbacks.json`, a quota error (usage limit, billing) switches at once to the next model and a follow-up message resumes the work; the failed model is skipped for 30 minutes, and a spent `/gentle:usage` window holds that model/provider until its reset. Nothing happens unless chains are configured. This is **switching model**, not waiting for the same model's reset.
+- **No keep-awake.** A search of the gentle-pi 5.1.0 package for inhibit, caffeinate, keep-awake, and wake-lock found nothing. keepgoing's sleep protection does not duplicate a Gentle feature.
+- **Opt-in model fallback chains.** When a profile has an ordered fallback list in `profile-fallbacks.json`, a quota (usage limit, billing) or auth error switches at once to the next model, and rate-limit, provider-unavailable, timeout, and network errors switch after Pi's own retries; a follow-up message resumes the work. A model that hit a limit or auth error is skipped for 30 minutes (2 minutes after a transient error), and a spent `/gentle:usage` limit holds that model—or the whole provider when every one of its limits is spent—until the reset. Nothing happens unless chains are configured. This is **switching model**, not waiting for the same model's reset.
 - **`/gentle:usage` is a display** and a cooldown input for those chains, not a scheduled continuation.
-- **The orchestrator's quota-recovery guidance is prompt text**, not automation: it says it is “not an automatic retry, provider/model fallback” and tells the model “Do not automatically wait, retry, or substitute a provider/model.”
+- **The orchestrator's quota-recovery guidance is prompt text**, not automation: it covers only a failed verifier, says it is “not an automatic retry, provider/model fallback”, and allows one new attempt only after the human reports restored availability and explicitly requests the missing verification.
 
 **Combining fallback chains with keepgoing on the same error is untested (unverified).** Both can react to the same settled quota error: a chain may send its follow-up on another model while keepgoing has scheduled a continuation for the original reset. Pick one per lane: fallback chains where switching model is acceptable, keepgoing where you want to wait for the same model's reset.
 
@@ -151,7 +151,7 @@ Need only manual system-sleep protection? Use `/jb:keepgoing inhibit on` and lat
 
 - keepgoing's implementation and behavior: [commands](docs/commands.md), [installation](docs/install.md), [recovery classification](src/recovery.ts), [extension lifecycle](extensions/keepgoing.ts), and deterministic tests (`tests/keepgoing.test.ts` in the source checkout; tests are not included in the package files).
 - Alternative capabilities are attributed to their package pages or upstream README below, checked November 17, 2026 (pi-caffeinated: November 2, 2026). No competitor was installed or benchmarked for this guide; no relative reliability, speed, or security ranking is claimed.
-- Gentle Shell capabilities come from the locally installed gentle-pi 4.8.0 package (`README.md` and `docs/readme-reference.md`, “Model fallback chains”; `assets/orchestrator-quota-recovery.md`) and its [repository][gentle-shell]. Its absence of keep-awake is based on a text search of that package, not on an audit. The interaction between its fallback chains and keepgoing is unverified.
+- Gentle Shell capabilities come from the locally installed gentle-pi 5.1.0 package, checked November 27, 2026 (`README.md` and `docs/readme-reference.md`, “Model fallback chains”; `assets/orchestrator-quota-recovery.md`) and its [repository][gentle-shell]. Its absence of keep-awake is based on a text search of that package, not on an audit. The interaction between its fallback chains and keepgoing is unverified.
 - Documentation and defaults can change. Recheck the linked sources before choosing or publishing an updated comparison.
 
 [keep-going]: https://pi.dev/packages/pi-keep-going
