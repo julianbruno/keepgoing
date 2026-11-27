@@ -1060,3 +1060,411 @@ test("concurrent retroactive lookups with unavailable reset never schedule", asy
   assert.equal(h.sent.length, 0);
 });
 
+for (const stage of ["credentials", "fetch", "body"]) for (const newWait of [false, true]) test(`off during ${stage} cancels all lookups; newer wait: ${newWait}`, async t => {
+  const h = harness({}, "tui");
+  const cmd = (arg: string) => h.commands.get("jb:keepgoing").handler(arg, h.ctx);
+  h.branch.push({ type: "message", message: { ...failure, errorMessage: "5-hour usage limit reached" } });
+  let release!: () => void;
+  const delayed = new Promise<void>(resolve => { release = resolve; });
+  let keys = 0, bodies = 0;
+  const signals: AbortSignal[] = [];
+  h.ctx.modelRegistry.isUsingOAuth = () => true;
+  h.ctx.modelRegistry.getApiKeyForProvider = async () => { keys++; if (stage === "credentials") await delayed; return "synthetic"; };
+  t.mock.method(globalThis, "fetch", async (_url: string, init: RequestInit) => {
+    signals.push(init.signal!);
+    if (stage === "fetch") await delayed;
+    return { ok: true, json: async () => { bodies++; if (stage === "body") await delayed; return { five_hour: { resets_at: "2026-09-12T13:00:00Z" } }; } };
+  });
+  const activations = [cmd("on"), cmd("on")];
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(keys, 2);
+  assert.equal(signals.length, stage === "credentials" ? 0 : 2);
+  await cmd("off");
+  assert.ok(signals.every(signal => signal.aborted), "off must abort each in-flight request before any replacement");
+  if (newWait) await cmd("wait 1m");
+  release();
+  await Promise.all(activations);
+  assert.equal(signals.length, stage === "credentials" ? 0 : 2);
+  assert.ok(signals.every(signal => signal.aborted));
+  assert.equal(bodies, stage === "body" ? 2 : 0);
+  h.advance(60_000);
+  h.advance(3_690_000);
+  assert.deepEqual(h.sent, newWait ? [{ message: "Continue", options: { expandPromptTemplates: false } }] : []);
+  assert.equal(h.owners.size, 0);
+});
+
+test("cancelled asynchronous retroactive lookups cannot schedule after lease loss", async () => {
+  let finish!: (value: null) => void;
+  const h = harness({ resolve: () => new Promise<null>(resolve => { finish = resolve; }) }, "tui");
+  h.branch.push({ type: "message", message: { ...failure, errorMessage: "5-hour usage limit reached" } });
+  const activation = h.commands.get("jb:keepgoing").handler("on", h.ctx);
+  h.owners.delete(oneLease);
+  finish(null);
+  await activation;
+  assert.equal(h.jobs.length, 0);
+  assert.equal(h.sent.length, 0);
+  assert.equal(h.entries.at(-1).data.enabled, false);
+});
+
+test("unexpected helper loss disables enabled keepgoing before any wait", async () => {
+  const h = backendHarness();
+  await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+  assert.equal(h.backend.has(oneLease), true);
+  h.children[0].emit("error", new Error("backend died"));
+  assert.equal(h.backend.has(oneLease), false);
+  await h.commands.get("jb:keepgoing").handler("status", h.ctx);
+  assert.match(h.messages.at(-1)!, /Resume is OFF/);
+  assert.match(h.messages.at(-1)!, /Previous wait cancelled because the system-sleep protection was lost/);
+  assert.equal(h.entries.at(-1).data.enabled, false);
+  await h.emit("agent_end", { messages: settled });
+  await h.emit("agent_settled");
+  assert.equal(h.sent.length, 0);
+  assert.equal(h.jobs.length, 0);
+});
+
+test("helper exit cancels pending TUI wait and removes input subscription", async () => {
+  const h = backendHarness();
+  await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+  await h.emit("agent_end", { messages: settled });
+  await h.emit("agent_settled");
+  assert.equal(h.terminalListeners.size, 1);
+  h.children[0].emit("exit", 1);
+  assert.equal(h.terminalListeners.size, 0);
+  h.advance(390_000);
+  assert.equal(h.sent.length, 0);
+  assert.match(h.messages.at(-1)!, /inhibitor|backend/i);
+});
+
+test("helper loss resolves blocking JSON/print settlement without continuation", async () => {
+  for (const mode of ["json", "print"]) {
+    const h = backendHarness(mode);
+    await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+    await h.emit("agent_end", { messages: settled });
+    let done = false;
+    const settling = h.emit("agent_settled").then(() => { done = true; });
+    for (let n = 0; n < 5; n++) await Promise.resolve();
+    assert.equal(done, false);
+    h.children[0].emit("exit", 1);
+    for (let n = 0; n < 5; n++) await Promise.resolve();
+    const resolvedOnLoss = done;
+    await h.emit("session_shutdown", { reason: "quit" });
+    await settling;
+    h.advance(390_000);
+    assert.equal(resolvedOnLoss, true, mode);
+    assert.equal(h.sent.length, 0);
+    assert.equal(h.entries.at(-1).data.enabled, false);
+  }
+});
+
+test("after loss keepgoing re-enable acquires a fresh helper before resuming", async () => {
+  const h = backendHarness();
+  await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+  h.children[0].emit("exit", 1);
+  await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+  assert.equal(h.children.length, 2);
+  assert.equal(h.backend.has(oneLease), true);
+  assert.equal(h.entries.at(-1).data.enabled, true);
+  h.children[0].emit("error", new Error("late failure"));
+  assert.equal(h.backend.has(oneLease), true);
+  await h.commands.get("jb:keepgoing").handler("status", h.ctx);
+  assert.match(h.messages.at(-1)!, /^✅ Resume is ON and watching for Claude's 5-hour usage limit\. Nothing is scheduled yet\.\n/);
+});
+
+test("manual-only helper loss makes manual status truthful without disabling a later keepgoing owner", async () => {
+  const h = backendHarness();
+  await h.commands.get("jb:keepgoing").handler("inhibit on", h.ctx);
+  h.children[0].emit("exit", 1);
+  await h.commands.get("jb:keepgoing").handler("inhibit status", h.ctx);
+  assert.equal(h.messages.at(-1), "Sleep inhibitor is inactive.");
+  await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+  h.children[0].emit("error", new Error("late old helper"));
+  assert.equal(h.backend.has(oneLease), true);
+  await h.commands.get("jb:keepgoing").handler("status", h.ctx);
+  assert.match(h.messages.at(-1)!, /^✅ Resume is ON and watching for Claude's 5-hour usage limit\. Nothing is scheduled yet\.\n/);
+});
+
+test("a stale enabled flag without a lease cannot authorize a new schedule", async () => {
+  const h = harness();
+  await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+  h.owners.delete(oneLease);
+  await h.emit("agent_end", { messages: settled });
+  await h.emit("agent_settled");
+  assert.equal(h.jobs.length, 0);
+  assert.equal(h.entries.at(-1).data.enabled, false);
+});
+
+test("a lost lease immediately before timer fire never sends a continuation", async () => {
+  const h = harness();
+  await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+  await h.emit("agent_end", { messages: settled });
+  await h.emit("agent_settled");
+  h.owners.delete(oneLease);
+  h.advance(390_000);
+  assert.equal(h.sent.length, 0);
+  assert.equal(h.entries.at(-1).data.enabled, false);
+});
+
+test("registers only the single /jb:keepgoing command without legacy aliases and defaults resume to on", async () => {
+  const h = harness();
+  assert.deepEqual([...h.commands.keys()], ["jb:keepgoing"]);
+  assert.equal(h.shortcuts.size, 0);
+  await h.commands.get("jb:keepgoing").handler("", h.ctx);
+  assert.equal(h.owners.has(oneLease), true);
+  await h.commands.get("jb:keepgoing").handler("inhibit on", h.ctx);
+  await h.commands.get("jb:keepgoing").handler("off", h.ctx);
+  assert.equal(h.owners.has("manual"), true);
+});
+
+test("resume ignores opt-in from another namespace and persists fresh opt-in under keepgoing.resume", async () => {
+  const h = harness({}, "tui");
+  const appended: string[] = [];
+  const appendEntry = h.pi.appendEntry;
+  h.pi.appendEntry = (type, data) => { appended.push(type); return appendEntry(type, data); };
+  h.branch.push({ type: "custom", customType: "other-extension.resume", data: { enabled: true, resumes: 2, fallback: 0, lastResume: 0 } });
+  await h.emit("session_start");
+  assert.equal(h.owners.size, 0);
+  const command = h.commands.get("jb:keepgoing");
+  await command.handler("status", h.ctx);
+  assert.match(h.messages.at(-1)!, /^⏸ Resume is OFF\. Nothing is scheduled\./);
+  assert.match(h.messages.at(-1)!, /Next: \/jb:keepgoing on to turn it on, or \/jb:keepgoing wait <1h\|24m> for a one-off delay\./);
+  await command.handler("on", h.ctx);
+  assert.deepEqual(appended, ["keepgoing.resume"]);
+  assert.deepEqual(h.entries.map(entry => entry.data.enabled), [true]);
+  assert.equal(h.owners.has(oneLease), true);
+});
+
+test("inhibit subcommand is dispatched independently of resume state", async () => {
+  const h = harness({}, "tui");
+  await h.commands.get("jb:keepgoing").handler("wait 24m", h.ctx);
+  const before = [h.entries.length, h.jobs.filter(job => !job.cancelled).length];
+  for (const arg of ["inhibit on", "inhibit status", "  inhibit   off  ", "inhibit status"]) await h.commands.get("jb:keepgoing").handler(arg, h.ctx);
+  assert.deepEqual(h.messages.slice(-4), ["Sleep inhibitor enabled.", "Sleep inhibitor is active.", "Sleep inhibitor disabled.", "Sleep inhibitor is inactive."]);
+  assert.deepEqual([h.entries.length, h.jobs.filter(job => !job.cancelled).length], before);
+  assert.deepEqual([...h.owners], [oneLease]);
+  await h.commands.get("jb:keepgoing").handler("status", h.ctx);
+  assert.match(h.messages.at(-1)!, /^⏳ Resume is OFF\. Waiting for your requested time only\./);
+  for (const arg of ["inhibit", "inhibit bogus", "inhibit on off", "inhibit ON"]) await h.commands.get("jb:keepgoing").handler(arg, h.ctx);
+  assert.deepEqual(h.messages.slice(-4), Array(4).fill("Usage: /jb:keepgoing inhibit on|off|status"));
+  assert.deepEqual([...h.owners], [oneLease]);
+  const fresh = harness();
+  await fresh.commands.get("jb:keepgoing").handler("inhibit on", fresh.ctx);
+  assert.deepEqual([fresh.entries.length, [...fresh.owners]], [0, ["manual"]]);
+});
+
+test("unknown arguments show the single-command usage without changing state", async () => {
+  const h = harness({}, "tui");
+  for (const arg of ["bogus", "inhibiton", "ON"]) await h.commands.get("jb:keepgoing").handler(arg, h.ctx);
+  assert.deepEqual(h.messages, Array(3).fill("Usage: /jb:keepgoing [on|off|status|now|wait <1h|24m>] or /jb:keepgoing inhibit on|off|status"));
+  assert.deepEqual([h.entries.length, h.owners.size, h.jobs.length], [0, 0, 0]);
+});
+
+test("argument completions cover resume arguments and inhibit subarguments", () => {
+  const command = harness().commands.get("jb:keepgoing");
+  const item = (value: string, label = value) => ({ value, label });
+  assert.equal(command.description, "Watch usage limits (on), schedule one Continue without enabling monitoring (wait <1h|24m>), manage recovery (off, status, now), or keep the system awake (inhibit on|off|status)");
+  assert.deepEqual(command.getArgumentCompletions(""), ["on", "off", "status", "now", "wait", "inhibit"].map(value => item(value)));
+  assert.deepEqual(command.getArgumentCompletions("o"), [item("on"), item("off")]);
+  assert.deepEqual(command.getArgumentCompletions("in"), [item("inhibit")]);
+  assert.deepEqual(command.getArgumentCompletions("inhibit "), [item("inhibit on", "on"), item("inhibit off", "off"), item("inhibit status", "status")]);
+  assert.deepEqual(command.getArgumentCompletions("inhibit s"), [item("inhibit status", "status")]);
+  assert.equal(command.getArgumentCompletions("inhibit x"), null);
+  assert.equal(command.getArgumentCompletions("missing"), null);
+});
+
+test("settled provider exhaustion resumes exactly once in same session, dropping failed context only during retry", async () => {
+  const h = harness();
+  await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+  await h.emit("agent_end", { messages: settled });
+  await h.emit("agent_settled");
+  assert.equal(h.jobs.length, 1);
+  h.advance(390_000);
+  assert.equal(h.sent.length, 1);
+  assert.deepEqual(h.sent[0], { message: "Continue the interrupted request after the provider usage window reset. Do not make decisions for the user.", options: { expandPromptTemplates: false } });
+  assert.equal(h.customSent.length, 0);
+  await h.emit("input", { source: "extension", text: h.sent[0].message });
+  const user = { role: "user", content: "work" };
+  const context = await h.emit("context", { messages: [failure, user] });
+  assert.deepEqual(context.messages, [user]);
+  h.advance(90_000);
+  assert.equal(h.sent.length, 1);
+});
+
+test("active Gentle Shell decision tool and UI prompt never schedule or fire", async () => {
+  const h = harness();
+  await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+  await h.emit("tool_execution_start", { toolCallId: "choice", toolName: "ask_user_choice" });
+  await h.emit("agent_end", { messages: settled });
+  await h.emit("agent_settled");
+  assert.equal(h.jobs.length, 0);
+  await h.emit("tool_execution_end", { toolCallId: "choice", toolName: "ask_user_choice" });
+  await h.emit("ui_prompt_start", { kind: "select" });
+  await h.emit("agent_end", { messages: settled });
+  await h.emit("agent_settled");
+  assert.equal(h.jobs.length, 0);
+  await h.emit("ui_prompt_end", { kind: "select" });
+  h.advance(3_600_000);
+  assert.equal(h.sent.length, 0);
+});
+
+test("recognized error without reset never schedules, nor does a generic server error", async () => {
+  const h = harness();
+  await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+  await h.emit("agent_end", { messages: [{ ...failure, errorMessage: "5-hour usage limit reached" }] });
+  await h.emit("agent_settled");
+  assert.equal(h.jobs.length, 0);
+  h.advance(600_000);
+  assert.equal(h.sent.length, 0);
+  const other = harness();
+  await other.commands.get("jb:keepgoing").handler("on", other.ctx);
+  await other.emit("agent_end", { messages: [{ ...failure, errorMessage: "Internal server error" }] });
+  await other.emit("agent_settled");
+  assert.equal(other.jobs.length, 0);
+});
+
+test("prompt opening after scheduling cancels even if it later closes", async () => {
+  const h = harness();
+  await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+  await h.emit("agent_end", { messages: settled });
+  await h.emit("agent_settled");
+  await h.emit("ui_prompt_start", { kind: "select" });
+  await h.emit("ui_prompt_end", { kind: "select" });
+  h.advance(390_000);
+  assert.equal(h.sent.length, 0);
+});
+
+test("user input during asynchronous reset lookup aborts and invalidates the old result", async () => {
+  let finish!: (value: number) => void;
+  let signal: AbortSignal | undefined;
+  const lookup = new Promise<number>(resolve => { finish = resolve; });
+  const h = harness({ resolve: (...args: any[]) => { signal = args.at(-1); return lookup; } });
+  await h.commands.get("jb:keepgoing").handler("on", h.ctx);
+  await h.emit("agent_end", { messages: [{ ...failure, errorMessage: "5-hour usage limit reached" }] });
+  const settling = h.emit("agent_settled");
+  await h.emit("input", { source: "interactive", text: "Take over" });
+  assert.equal(signal?.aborted, true);
+  finish(Date.parse("2026-09-12T13:00:00Z"));
+  await settling;
+  assert.equal(h.jobs.length, 0);
+});
+
+test("copied consent is inert in a fork; the same session restores and recovers", async () => {
+  const source = harness();
+  await source.commands.get("jb:keepgoing").handler("on", source.ctx);
+  for (const session of ["one", "fork"]) {
+    const h = harness({}, "tui");
+    h.setSession(session);
+    replay(h, source.entries);
+    await h.emit("session_start");
+    await h.emit("agent_end", { messages: settled });
+    await h.emit("agent_settled", { aborted: false });
+    h.advance(390_000);
+    assert.deepEqual(h.sent, session === "one" ? [resetContinuation] : []);
+    assert.deepEqual([...h.owners], session === "one" ? [oneLease] : []);
+    if (session === "fork") assert.deepEqual([h.jobs.length, h.entries.length], [0, 0]);
+  }
+});
+
+test("only own consent records can enable or disable restored monitoring", async () => {
+  for (const ownOn of [true, false]) {
+    const source = harness();
+    const command = source.commands.get("jb:keepgoing");
+    await command.handler("on", source.ctx);
+    if (!ownOn) await command.handler("off", source.ctx);
+    source.setSession("other");
+    await command.handler(ownOn ? "off" : "on", source.ctx);
+    const h = harness();
+    replay(h, source.entries);
+    await h.emit("session_start");
+    await h.emit("agent_end", { messages: settled });
+    await h.emit("agent_settled", { aborted: false });
+    h.advance(390_000);
+    assert.equal(h.owners.has(oneLease), ownOn);
+    assert.deepEqual(h.sent, ownOn ? [resetContinuation] : []);
+  }
+});
+
+test("ownerless legacy consent preserves own submission history without a lease or continuation", async () => {
+  const h = harness({}, "tui");
+  h.branch.push({ type: "custom", customType: "keepgoing.resume", data: { enabled: true, resumes: 1,
+    lastContinuationAt: Date.parse("2026-09-10T12:00:00Z"), lastContinuationSession: "one" } });
+  await h.emit("session_start");
+  await h.emit("agent_end", { messages: settled });
+  await h.emit("agent_settled", { aborted: false });
+  h.advance(390_000);
+  await h.commands.get("jb:keepgoing").handler("status", h.ctx);
+  assert.match(h.messages.at(-1)!, /Resume is OFF.*Last continuation at:/s);
+  assert.deepEqual([h.owners.size, h.jobs.length, h.entries.length, h.sent.length], [0, 0, 0, 0]);
+});
+
+test("aborted settlement cannot recover its failure on later settlement or retroactive on, even after reload", async () => {
+  const h = harness();
+  const command = h.commands.get("jb:keepgoing");
+  await command.handler("on", h.ctx);
+  h.branch.push({ type: "message", id: "failed", message: failure });
+  await h.emit("agent_end", { messages: settled });
+  await h.emit("agent_settled", { aborted: true });
+  await h.emit("agent_settled", { aborted: false });
+  await command.handler("on", h.ctx);
+  const reload = harness();
+  reload.branch.push(structuredClone(h.branch[0]));
+  replay(reload, h.entries);
+  await reload.emit("session_start");
+  await reload.commands.get("jb:keepgoing").handler("on", reload.ctx);
+  for (const run of [h, reload]) {
+    run.advance(390_000);
+    assert.deepEqual([run.jobs.length, run.sent.length], [0, 0]);
+    assert.deepEqual([...run.owners], [oneLease]);
+  }
+});
+
+test("retroactive on before an aborted settlement does not start a lookup for the unsettled failure", async () => {
+  let lookups = 0;
+  const h = harness({ resolve: () => { lookups++; return Date.parse("2026-09-12T12:05:00Z"); } });
+  await h.emit("session_start");
+  h.branch.push({ type: "message", id: "failure", message: failure });
+  await h.emit("agent_end", { messages: settled });
+  await h.emit("input", { source: "interactive" });
+  const command = h.commands.get("jb:keepgoing");
+  await command.handler("on", h.ctx);
+  await h.emit("agent_settled", { aborted: true });
+  await command.handler("on", h.ctx);
+  h.advance(390_000);
+  assert.deepEqual([lookups, h.jobs.length, h.sent.length], [0, 0, 0]);
+  assert.deepEqual([...h.owners], [oneLease]);
+});
+
+test("aborted settlement leaves an independent requested wait and explicit on intact", async () => {
+  const h = harness();
+  const command = h.commands.get("jb:keepgoing");
+  await command.handler("on", h.ctx);
+  await command.handler("wait 1m", h.ctx);
+  await h.emit("agent_end", { messages: settled });
+  await h.emit("agent_settled", { aborted: true });
+  h.advance(390_000);
+  assert.deepEqual(h.sent, [{ message: "Continue", options: { expandPromptTemplates: false } }]);
+  assert.deepEqual([...h.owners], [oneLease]);
+});
+
+for (const file of ["/sessions/copied.jsonl", undefined]) {
+  test(`S2 file identity: same ID in ${file ?? "memory"} does not restore consent`, async () => {
+    const source = harness();
+    await source.commands.get("jb:keepgoing").handler("on", source.ctx);
+    const h = harness();
+    h.ctx.sessionManager.getSessionFile = () => file;
+    replay(h, source.entries);
+    await h.emit("session_start");
+    await h.emit("agent_end", { messages: settled });
+    await h.emit("agent_settled", { aborted: false });
+    h.advance(390_000);
+    assert.deepEqual([h.owners.size, h.jobs.length, h.sent.length], [0, 0, 0]);
+  });
+}
+
+test("S2 file identity: a timer cannot cross a same-ID file switch before lifecycle notification", async () => {
+  const h = harness();
+  await h.commands.get("jb:keepgoing").handler("wait 1m", h.ctx);
+  h.ctx.sessionManager.getSessionFile = () => "/sessions/fork.jsonl";
+  h.advance(60_000);
+  assert.deepEqual([h.sent.length, h.owners.size], [0, 0]);
+});
+
