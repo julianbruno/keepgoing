@@ -295,8 +295,17 @@ test("warnings, conditions and unreadable reset shapes fail closed", () => {
     "Caution: you've hit your 5-hour usage limit. Try again later.", "Nearing your 5-hour usage limit. 5-hour usage limit reached.",
     "You're close to your limit. You've hit your 5-hour usage limit. Try again later.", "You've hit your 5-hour usage limit, but you can continue. Try again later.",
     "You've hit your usage limit. Try again in 3 days.", "You've hit your usage limit. Try again in 12 hours.",
-    "You've hit your usage limit. Try again in seven hours.",
+    "You've hit your usage limit. Try again in seven hours.", "You've hit your usage limit. Try again next week.",
+    "You've hit your usage limit. Try again on Monday.", "You've hit your usage limit. Try again next month.",
+    "You've hit your usage limit. Try again later this week.", "You've hit your usage limit. Try again in 6.5 hours.",
+    "You've hit your usage limit. Try again in 400 minutes.", "You've hit your usage limit. Try again in a fortnight.",
+    "You've hit your usage limit. Try again overnight.", "You've hit your usage limit. Try again after the weekend.",
   ]) assert.equal(classifyLimit(provider, text), false, `${provider}: ${text}`);
+  // A short reset still counts, and "Learn more" is a link label, not capacity.
+  for (const provider of ["openai-codex", "anthropic"]) for (const text of [
+    "You've hit your usage limit. Try again in 300 minutes.", "You've hit your usage limit. Try again in 4h 59m.",
+    "You've hit your usage limit. Learn more: https://example.com/limits. Try again later.",
+  ]) assert.equal(classifyLimit(provider, text), true, `${provider}: ${text}`);
   // The classifier accepts only reset shapes the Bridge reset reader can resolve.
   for (const reset of ["· resets 0am (Europe/Madrid)", "· resets 13pm (Europe/Madrid)", "· resets 1:60am (Europe/Madrid)", "· resets 4 pm (Europe/Madrid)", "· resets 4pm", "· resets 4:30:00pm (Europe/Madrid)", "· resets 4p.m. (Europe/Madrid)", "· resets at 4pm (Europe/Madrid)"]) {
     assert.equal(classifyLimit("claude-bridge", `You've hit your 5-hour limit ${reset}`), false, reset);

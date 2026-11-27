@@ -13,10 +13,16 @@ const exhaustedCap = /\byou(?:['’]ve| have)? (?:hit|reached|exhausted|exceeded
 // Exhaustion is recognised only in an exact, known shape. Anything else fails closed and
 // schedules nothing, so an unlisted wording can never authorize an unrequested Continue.
 const questionMark = /[?？؟‽﹖¿]/;
-const capacityWord = /\b(?:remain\w*|left|unused|spare|balance|percent|unlimited|plenty|lots|more|still|continue)\b|%/i;
+const capacityWord = /\b(?:remain\w*|left|unused|spare|balance|percent|unlimited|plenty|lots|(?<!learn\s)more|still|continue)\b|%/i;
 // Warnings and conditions describe a limit that has not been reached yet.
 // A stated reset beyond the five-hour window belongs to another limit; never schedule against it.
-const farReset = /\b(?:(?:\d+|an?|one|two|three|four|five|six|seven|few|several)\s*(?:days?|weeks?)|tomorrow|(?:[6-9]|\d{2,}|six|seven|eight|nine|ten|eleven|twelve|twenty[ -]four)\s*(?:hours?|hrs?|h))\b/i;
+const farReset = new RegExp([
+  String.raw`(?:\d+(?:\.\d+)?|an?|one|two|three|four|five|six|seven|few|several)\s*(?:days?|weeks?|months?)`,
+  String.raw`(?:next|this|later this|after the)\s+(?:week|weekend|month)`,
+  String.raw`(?:mon|tues|wednes|thurs|fri|satur|sun)day|tomorrow|tonight|overnight|fortnight`,
+  String.raw`(?:[6-9]|\d{2,})(?:\.\d+)?\s*(?:hours?|hrs?|h)|(?:six|seven|eight|nine|ten|eleven|twelve|twenty[ -]four)\s*(?:hours?|hrs?)`,
+  String.raw`(?:3[6-9]\d|[4-9]\d\d|\d{4,})\s*(?:minutes?|mins?)`,
+].map(part => String.raw`\b(?:${part})\b`).join("|"), "i");
 const warningWord = /\b(?:warnings?|alerts?|notices?|threshold|level|soon|shortly|upcoming|caution|heads[ -]up|almost|nearly|nearing|approaching|close to)\b/i;
 const unitWord = /\b(?:requests?|reqs?|messages?|msgs?|prompts?|turns?|tokens?|credits?|quer(?:y|ies)|calls?|conversations?|chats?|responses?|completions?|uses)\b/i;
 // Numbers are explained only by the window label or by a time that follows a reset or
