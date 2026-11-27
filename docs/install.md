@@ -33,6 +33,8 @@ Uninstall uses Pi’s `--no-approve` option so it does not load project-local se
 
 If replacing an installation from a **different source**, inspect `pi list` and use Pi’s package management commands deliberately. For a personal local path, use its resolved absolute path; `(filtered)` is a display annotation. Removing a managed Git/npm package can delete its managed files. Restart Pi before enabling the new copy. Previous opt-in and pending timers do not carry over.
 
+To remove the legacy **sleeppi** package from every discovered Pi home on Linux or macOS, preview with `./uninstall-sleeppi.sh`, then apply with `./uninstall-sleeppi.sh --apply`. It removes only personal (`User packages:`) sleeppi registrations; project packages, manual extensions, and keepgoing are left alone. Restart Pi afterwards.
+
 ## Optional checkout installers
 
 By default the scripts use the active Pi home. To manage all discovered homes, unset `PI_CODING_AGENT_DIR` and preview first: `./install.sh --all-homes --dry-run` or `.\install.ps1 -AllHomes -DryRun`. Remove the dry-run flag to apply. The uninstall scripts accept the same flags.
